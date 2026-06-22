@@ -125,6 +125,7 @@ func (a OpenAIResponsesAdapter) DecodeResponse(raw []byte) (*LLMResponse, error)
 	}
 
 	content := make([]Part, 0)
+	usage := decodeOpenAIResponsesUsage(response.Usage)
 	hasToolCall := false
 	hasRefusal := false
 	for _, item := range response.Output {
@@ -149,7 +150,12 @@ func (a OpenAIResponsesAdapter) DecodeResponse(raw []byte) (*LLMResponse, error)
 			content = append(content, decodeOpenAIResponsesToolResult(item))
 			continue
 		}
-		if item.Type == "image_generation_call" || item.Type == "input_image" {
+		if item.Type == "image_generation_call" {
+			mergeOpenAIResponsesUsage(&usage, decodeOpenAIResponsesImageUsage(item.Usage))
+			content = append(content, decodeOpenAIResponsesImageOutputItem(item)...)
+			continue
+		}
+		if item.Type == "input_image" {
 			content = append(content, decodeOpenAIResponsesImageOutputItem(item)...)
 			continue
 		}
@@ -179,7 +185,7 @@ func (a OpenAIResponsesAdapter) DecodeResponse(raw []byte) (*LLMResponse, error)
 		Role:             RoleAssistant,
 		Content:          content,
 		FinishReason:     finishReason,
-		Usage:            decodeOpenAIResponsesUsage(response.Usage),
+		Usage:            usage,
 		ProviderMetadata: map[string]any{"object": response.Object, "status": response.Status},
 	}, nil
 }
@@ -997,6 +1003,55 @@ func decodeOpenAIResponsesUsage(usage openAIResponsesUsage) Usage {
 	return decoded
 }
 
+func decodeOpenAIResponsesImageUsage(usage openAIResponsesUsage) Usage {
+	decoded := Usage{InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens}
+	if decoded.InputTokens == nil && usage.InputTokensDetails != nil {
+		inputTokens := intValue(usage.InputTokensDetails.TextTokens) + intValue(usage.InputTokensDetails.ImageTokens)
+		if inputTokens > 0 {
+			decoded.InputTokens = &inputTokens
+		}
+	}
+	if decoded.OutputTokens == nil && usage.OutputTokensDetails != nil {
+		outputTokens := intValue(usage.OutputTokensDetails.TextTokens) + intValue(usage.OutputTokensDetails.ImageTokens)
+		if outputTokens > 0 {
+			decoded.OutputTokens = &outputTokens
+		}
+	}
+	return decoded
+}
+
+func mergeOpenAIResponsesUsage(base *Usage, extra Usage) {
+	if base == nil {
+		return
+	}
+	base.InputTokens = addUsageTokens(base.InputTokens, extra.InputTokens)
+	base.OutputTokens = addUsageTokens(base.OutputTokens, extra.OutputTokens)
+}
+
+func mergeOpenAIResponsesStreamImageUsage(base *Usage, items []openAIResponsesStreamItem) {
+	for _, item := range items {
+		if item.Type != "image_generation_call" {
+			continue
+		}
+		mergeOpenAIResponsesUsage(base, decodeOpenAIResponsesImageUsage(item.Usage))
+	}
+}
+
+func responseStreamOutputItems(raw openAIResponsesStreamEvent) []openAIResponsesStreamItem {
+	if raw.Response != nil && len(raw.Response.Output) > 0 {
+		return raw.Response.Output
+	}
+	return raw.Output
+}
+
+func addUsageTokens(left *int, right *int) *int {
+	if right == nil {
+		return left
+	}
+	sum := intValue(left) + intValue(right)
+	return &sum
+}
+
 func encodeOpenAIResponsesUsage(usage Usage, billingUsage BillingUsage) openAIResponsesUsage {
 	if hasBillingUsage(billingUsage) {
 		inputTokens := billingUsage.InputTokens + billingUsage.CachedInputTokens
@@ -1268,6 +1323,7 @@ type openAIResponsesOutputItem struct {
 	ImageURL         string                       `json:"image_url,omitempty"`
 	Result           string                       `json:"result,omitempty"`
 	OutputFormat     string                       `json:"output_format,omitempty"`
+	Usage            openAIResponsesUsage         `json:"usage,omitempty"`
 	EncryptedContent string                       `json:"encrypted_content,omitempty"`
 }
 
@@ -1281,10 +1337,14 @@ type openAIResponsesUsage struct {
 
 type openAIResponsesInputTokensDetails struct {
 	CachedTokens *int `json:"cached_tokens,omitempty"`
+	TextTokens   *int `json:"text_tokens,omitempty"`
+	ImageTokens  *int `json:"image_tokens,omitempty"`
 }
 
 type openAIResponsesOutputTokensDetails struct {
 	ReasoningTokens *int `json:"reasoning_tokens,omitempty"`
+	TextTokens      *int `json:"text_tokens,omitempty"`
+	ImageTokens     *int `json:"image_tokens,omitempty"`
 }
 
 type openAIResponsesStreamEvent struct {
@@ -1311,6 +1371,7 @@ type openAIResponsesStreamResponse struct {
 	IncompleteDetails *openAIResponsesIncompleteDetails `json:"incomplete_details,omitempty"`
 	Model             string                            `json:"model,omitempty"`
 	Usage             *openAIResponsesUsage             `json:"usage,omitempty"`
+	Output            []openAIResponsesStreamItem       `json:"output,omitempty"`
 }
 
 type openAIResponsesStreamItem struct {
@@ -1325,6 +1386,7 @@ type openAIResponsesStreamItem struct {
 	Content          []openAIResponsesContentPart `json:"content,omitempty"`
 	Summary          []openAIResponsesContentPart `json:"summary,omitempty"`
 	EncryptedContent string                       `json:"encrypted_content,omitempty"`
+	Usage            openAIResponsesUsage         `json:"usage,omitempty"`
 }
 
 type openAIResponsesStreamContentPart struct {
@@ -1481,6 +1543,7 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 				finish.Usage = decodeOpenAIResponsesUsage(*raw.Response.Usage)
 			}
 		}
+		mergeOpenAIResponsesStreamImageUsage(&finish.Usage, responseStreamOutputItems(raw))
 		parts = append(parts, finish)
 		return parts, nil
 	case "response.incomplete":
@@ -1493,6 +1556,7 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 				finish.Usage = decodeOpenAIResponsesUsage(*raw.Response.Usage)
 			}
 		}
+		mergeOpenAIResponsesStreamImageUsage(&finish.Usage, responseStreamOutputItems(raw))
 		parts = append(parts, finish)
 		return parts, nil
 	case "response.failed":

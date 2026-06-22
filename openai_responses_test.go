@@ -483,6 +483,40 @@ func TestOpenAIResponsesDecodeResponse(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesDecodeResponseMergesImageGenerationUsage(t *testing.T) {
+	adapter := NewOpenAIResponsesAdapter()
+	raw := []byte(`{
+		"id":"resp_1",
+		"object":"response",
+		"status":"completed",
+		"model":"gpt-5.4",
+		"output":[{
+			"type":"image_generation_call",
+			"result":"abc",
+			"output_format":"png",
+			"usage":{
+				"input_tokens":7,
+				"output_tokens":11,
+				"total_tokens":18,
+				"input_tokens_details":{"text_tokens":2,"image_tokens":5}
+			}
+		}],
+		"usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13,"input_tokens_details":{"cached_tokens":4}}
+	}`)
+
+	resp, err := adapter.DecodeResponse(raw)
+	if err != nil {
+		t.Fatalf("DecodeResponse() error = %v", err)
+	}
+	billingUsage := resp.BillingUsage()
+	if billingUsage.InputTokens != 13 || billingUsage.CachedInputTokens != 4 || billingUsage.OutputTokens != 14 {
+		t.Fatalf("billing usage = %+v", billingUsage)
+	}
+	if *resp.Usage.InputTokens != 17 || *resp.Usage.OutputTokens != 14 || *resp.Usage.CachedInputTokens != 4 {
+		t.Fatalf("usage = %+v", resp.Usage)
+	}
+}
+
 func TestOpenAIResponsesDecodeResponseToolCallDoesNotOverrideIncompleteStatus(t *testing.T) {
 	adapter := NewOpenAIResponsesAdapter()
 	raw := []byte(`{
@@ -951,6 +985,76 @@ func TestOpenAIResponsesStreamDecoder(t *testing.T) {
 	}
 	if len(parts) != 1 || parts[0].Type != StreamToolInputDelta || parts[0].ID != "custom_1" || parts[0].ToolCallID != "call_custom" || parts[0].ToolName != "grammar_tool" || parts[0].Delta != "raw" || parts[0].ProviderMetadata["custom_tool_call"] != true {
 		t.Fatalf("custom tool delta parts = %+v", parts)
+	}
+}
+
+func TestOpenAIResponsesStreamDecoderMergesImageGenerationUsage(t *testing.T) {
+	decoder, err := NewOpenAIResponsesAdapter().NewStreamDecoder(StreamDecodeOptions{})
+	if err != nil {
+		t.Fatalf("NewStreamDecoder() error = %v", err)
+	}
+
+	parts, err := decoder.Decode(RawStreamEvent{Event: "response.completed", Data: []byte(`{
+		"type":"response.completed",
+		"response":{
+			"id":"resp_1",
+			"status":"completed",
+			"usage":{"input_tokens":10,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}},
+			"output":[{
+				"type":"image_generation_call",
+				"usage":{
+					"input_tokens":7,
+					"output_tokens":11,
+					"input_tokens_details":{"text_tokens":2,"image_tokens":5}
+				}
+			}]
+		}
+	}`)})
+	if err != nil {
+		t.Fatalf("Decode(completed) error = %v", err)
+	}
+	if len(parts) != 1 || parts[0].Type != StreamFinish {
+		t.Fatalf("completed parts = %+v", parts)
+	}
+	billingUsage := billingUsageForProtocol(ProtocolOpenAIResponses, parts[0].Usage)
+	if billingUsage.InputTokens != 13 || billingUsage.CachedInputTokens != 4 || billingUsage.OutputTokens != 14 {
+		t.Fatalf("billing usage = %+v", billingUsage)
+	}
+}
+
+func TestOpenAIResponsesStreamDecoderDoesNotDoubleCountDuplicateImageGenerationOutput(t *testing.T) {
+	decoder, err := NewOpenAIResponsesAdapter().NewStreamDecoder(StreamDecodeOptions{})
+	if err != nil {
+		t.Fatalf("NewStreamDecoder() error = %v", err)
+	}
+
+	parts, err := decoder.Decode(RawStreamEvent{Event: "response.completed", Data: []byte(`{
+		"type":"response.completed",
+		"response":{
+			"id":"resp_1",
+			"status":"completed",
+			"usage":{"input_tokens":10,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}},
+			"output":[{
+				"id":"ig_1",
+				"type":"image_generation_call",
+				"usage":{"input_tokens":7,"output_tokens":11}
+			}]
+		},
+		"output":[{
+			"id":"ig_1",
+			"type":"image_generation_call",
+			"usage":{"input_tokens":7,"output_tokens":11}
+		}]
+	}`)})
+	if err != nil {
+		t.Fatalf("Decode(completed) error = %v", err)
+	}
+	if len(parts) != 1 || parts[0].Type != StreamFinish {
+		t.Fatalf("completed parts = %+v", parts)
+	}
+	billingUsage := billingUsageForProtocol(ProtocolOpenAIResponses, parts[0].Usage)
+	if billingUsage.InputTokens != 13 || billingUsage.CachedInputTokens != 4 || billingUsage.OutputTokens != 14 {
+		t.Fatalf("billing usage = %+v", billingUsage)
 	}
 }
 
