@@ -536,6 +536,10 @@ func (e *anthropicStreamEncoder) encodeToolCall(part StreamPart) ([]RawStreamEve
 
 func (e *anthropicStreamEncoder) encodeFinish(part StreamPart) []RawStreamEvent {
 	usage := encodeAnthropicUsage(part.Usage, billingUsageForProtocol(ProtocolAnthropicMessages, part.Usage))
+	if usage.OutputTokens == nil {
+		outputTokens := 0
+		usage.OutputTokens = &outputTokens
+	}
 	if part.FinishReason == "" {
 		part.FinishReason = FinishStop
 	}

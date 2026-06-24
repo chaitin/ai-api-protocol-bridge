@@ -741,6 +741,28 @@ func TestAnthropicMessagesStreamEncoder(t *testing.T) {
 	}
 }
 
+func TestAnthropicMessagesStreamEncoderFinishDefaultsOutputTokens(t *testing.T) {
+	encoder, err := NewAnthropicMessagesAdapter().NewStreamEncoder(StreamEncodeOptions{Model: "claude"})
+	if err != nil {
+		t.Fatalf("NewStreamEncoder() error = %v", err)
+	}
+
+	events, err := encoder.Encode(StreamPart{Type: StreamFinish, FinishReason: FinishStop})
+	if err != nil {
+		t.Fatalf("Encode(StreamFinish) error = %v", err)
+	}
+	if len(events) != 2 || events[0].Event != "message_delta" {
+		t.Fatalf("finish events = %+v", events)
+	}
+	var decoded anthropicStreamEvent
+	if err := json.Unmarshal(events[0].Data, &decoded); err != nil {
+		t.Fatalf("Unmarshal(message_delta) error = %v", err)
+	}
+	if decoded.Usage == nil || decoded.Usage.OutputTokens == nil || *decoded.Usage.OutputTokens != 0 {
+		t.Fatalf("message_delta usage = %+v", decoded.Usage)
+	}
+}
+
 func TestAnthropicMessagesStreamEncoderReusesSingleActiveBlockForEmptyDeltaID(t *testing.T) {
 	encoder, err := NewAnthropicMessagesAdapter().NewStreamEncoder(StreamEncodeOptions{Model: "claude"})
 	if err != nil {
