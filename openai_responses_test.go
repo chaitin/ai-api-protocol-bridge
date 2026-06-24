@@ -799,7 +799,7 @@ func TestOpenAIResponsesDecodeEncryptedReasoningAndCustomTool(t *testing.T) {
 		t.Fatalf("content = %+v", resp.Content)
 	}
 	reasoning := resp.Content[0].Reasoning
-	if reasoning == nil || reasoning.Text != "summary" || reasoning.Redacted != "enc_1" || reasoning.Signature != "enc_1" {
+	if reasoning == nil || reasoning.Text != "summary" || reasoning.Redacted != "" || reasoning.Signature != "enc_1" {
 		t.Fatalf("reasoning = %+v", reasoning)
 	}
 	toolCall := resp.Content[1].ToolCall

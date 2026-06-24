@@ -155,6 +155,42 @@ func TestAnthropicToOpenAIResponsesBridgeDecodeUpstreamResponse(t *testing.T) {
 	}
 }
 
+func TestAnthropicInboundOpenAIResponsesResponseEncodesEncryptedReasoningSummaryAsThinking(t *testing.T) {
+	bridge, ok := NewCrossFamilyBridge(ProtocolAnthropicMessages, "openai")
+	if !ok {
+		t.Fatal("NewCrossFamilyBridge() ok = false, want true")
+	}
+	upstreamRaw := []byte(`{
+		"id":"resp_1",
+		"object":"response",
+		"status":"completed",
+		"model":"gpt-5.4",
+		"output":[
+			{"type":"reasoning","encrypted_content":"enc_1","summary":[{"type":"summary_text","text":"summary"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello back"}]}
+		]
+	}`)
+
+	resp, err := bridge.DecodeUpstreamResponse(upstreamRaw)
+	if err != nil {
+		t.Fatalf("DecodeUpstreamResponse() error = %v", err)
+	}
+	raw, err := NewAnthropicMessagesAdapter().EncodeResponse(resp, EncodeResponseOptions{Model: "claude-sonnet"})
+	if err != nil {
+		t.Fatalf("EncodeResponse() error = %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	content := decoded["content"].([]any)
+	reasoning := content[0].(map[string]any)
+	if reasoning["type"] != "thinking" || reasoning["thinking"] != "summary" || reasoning["signature"] != "enc_1" {
+		t.Fatalf("reasoning content = %+v", reasoning)
+	}
+}
+
 func TestAnthropicToOpenAIResponsesBridgeEncodesContentFilterAsAnthropicRefusal(t *testing.T) {
 	bridge, ok := NewCrossFamilyBridge(ProtocolAnthropicMessages, "openai")
 	if !ok {
@@ -783,6 +819,204 @@ func TestAnthropicInboundOpenAIResponsesUpstreamStreamBridge(t *testing.T) {
 	}
 	if finish.Usage.CacheReadInputTokens == nil || *finish.Usage.CacheReadInputTokens != 3 || finish.Usage.OutputTokens == nil || *finish.Usage.OutputTokens != 5 {
 		t.Fatalf("finish usage = %+v", finish.Usage)
+	}
+}
+
+func TestAnthropicInboundOpenAIResponsesStreamDoesNotDuplicateContentStart(t *testing.T) {
+	bridge, ok := NewCrossFamilyBridge(ProtocolAnthropicMessages, "openai")
+	if !ok {
+		t.Fatal("NewCrossFamilyBridge() ok = false, want true")
+	}
+	decoder, err := bridge.NewStreamDecoder(StreamDecodeOptions{})
+	if err != nil {
+		t.Fatalf("NewStreamDecoder() error = %v", err)
+	}
+	encoder, err := bridge.NewStreamEncoder(StreamEncodeOptions{Model: "claude-sonnet"})
+	if err != nil {
+		t.Fatalf("NewStreamEncoder() error = %v", err)
+	}
+
+	parts, err := decoder.Decode(RawStreamEvent{Event: "response.created", Data: []byte(`{"type":"response.created","response":{"id":"resp_1","status":"in_progress","model":"gpt-5.4"}}`)})
+	if err != nil {
+		t.Fatalf("Decode(response.created) error = %v", err)
+	}
+	for _, part := range parts {
+		if _, err := encoder.Encode(part); err != nil {
+			t.Fatalf("Encode(response.created) error = %v", err)
+		}
+	}
+
+	parts, err = decoder.Decode(RawStreamEvent{Event: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","item":{"id":"msg_1","type":"message","role":"assistant","status":"in_progress"}}`)})
+	if err != nil {
+		t.Fatalf("Decode(output_item.added) error = %v", err)
+	}
+	var startEvents []RawStreamEvent
+	for _, part := range parts {
+		encoded, err := encoder.Encode(part)
+		if err != nil {
+			t.Fatalf("Encode(output_item.added) error = %v", err)
+		}
+		startEvents = append(startEvents, encoded...)
+	}
+	if len(startEvents) != 1 || startEvents[0].Event != "content_block_start" {
+		t.Fatalf("output_item.added events = %+v", startEvents)
+	}
+
+	parts, err = decoder.Decode(RawStreamEvent{Event: "response.content_part.added", Data: []byte(`{"type":"response.content_part.added","item_id":"msg_1","content_part":{"type":"output_text","text":""}}`)})
+	if err != nil {
+		t.Fatalf("Decode(content_part.added) error = %v", err)
+	}
+	var duplicateEvents []RawStreamEvent
+	for _, part := range parts {
+		encoded, err := encoder.Encode(part)
+		if err != nil {
+			t.Fatalf("Encode(content_part.added) error = %v", err)
+		}
+		duplicateEvents = append(duplicateEvents, encoded...)
+	}
+	if len(duplicateEvents) != 0 {
+		t.Fatalf("content_part.added should not emit duplicate Anthropic start, events = %+v", duplicateEvents)
+	}
+}
+
+func TestAnthropicInboundOpenAIResponsesStreamPreservesReasoningSignature(t *testing.T) {
+	bridge, ok := NewCrossFamilyBridge(ProtocolAnthropicMessages, "openai")
+	if !ok {
+		t.Fatal("NewCrossFamilyBridge() ok = false, want true")
+	}
+	decoder, err := bridge.NewStreamDecoder(StreamDecodeOptions{})
+	if err != nil {
+		t.Fatalf("NewStreamDecoder() error = %v", err)
+	}
+	encoder, err := bridge.NewStreamEncoder(StreamEncodeOptions{Model: "claude-sonnet"})
+	if err != nil {
+		t.Fatalf("NewStreamEncoder() error = %v", err)
+	}
+
+	parts, err := decoder.Decode(RawStreamEvent{Event: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning","status":"in_progress"}}`)})
+	if err != nil {
+		t.Fatalf("Decode(reasoning added) error = %v", err)
+	}
+	for _, part := range parts {
+		if _, err := encoder.Encode(part); err != nil {
+			t.Fatalf("Encode(reasoning added) error = %v", err)
+		}
+	}
+
+	parts, err = decoder.Decode(RawStreamEvent{Event: "response.reasoning_summary_text.done", Data: []byte(`{"type":"response.reasoning_summary_text.done","item_id":"rs_1"}`)})
+	if err != nil {
+		t.Fatalf("Decode(reasoning summary done) error = %v", err)
+	}
+	var summaryDoneEvents []RawStreamEvent
+	for _, part := range parts {
+		encoded, err := encoder.Encode(part)
+		if err != nil {
+			t.Fatalf("Encode(reasoning summary done) error = %v", err)
+		}
+		summaryDoneEvents = append(summaryDoneEvents, encoded...)
+	}
+	if len(summaryDoneEvents) != 0 {
+		t.Fatalf("reasoning summary done should wait for output_item.done, events = %+v", summaryDoneEvents)
+	}
+
+	parts, err = decoder.Decode(RawStreamEvent{Event: "response.reasoning.done", Data: []byte(`{"type":"response.reasoning.done","item_id":"rs_1"}`)})
+	if err != nil {
+		t.Fatalf("Decode(reasoning done event) error = %v", err)
+	}
+	var reasoningDoneEvents []RawStreamEvent
+	for _, part := range parts {
+		encoded, err := encoder.Encode(part)
+		if err != nil {
+			t.Fatalf("Encode(reasoning done event) error = %v", err)
+		}
+		reasoningDoneEvents = append(reasoningDoneEvents, encoded...)
+	}
+	if len(reasoningDoneEvents) != 0 {
+		t.Fatalf("reasoning done should wait for output_item.done, events = %+v", reasoningDoneEvents)
+	}
+
+	parts, err = decoder.Decode(RawStreamEvent{Event: "response.output_item.done", Data: []byte(`{"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","status":"completed","encrypted_content":"enc_1"}}`)})
+	if err != nil {
+		t.Fatalf("Decode(reasoning done) error = %v", err)
+	}
+	var events []RawStreamEvent
+	for _, part := range parts {
+		encoded, err := encoder.Encode(part)
+		if err != nil {
+			t.Fatalf("Encode(reasoning done) error = %v", err)
+		}
+		events = append(events, encoded...)
+	}
+	if len(events) != 2 {
+		t.Fatalf("reasoning done events = %+v", events)
+	}
+	var signature anthropicStreamEvent
+	if err := json.Unmarshal(events[0].Data, &signature); err != nil {
+		t.Fatalf("json.Unmarshal(signature) error = %v", err)
+	}
+	if signature.Type != "content_block_delta" || signature.Delta == nil || signature.Delta.Type != "signature_delta" || signature.Delta.Signature != "enc_1" {
+		t.Fatalf("signature event = %+v", signature)
+	}
+	if events[1].Event != "content_block_stop" {
+		t.Fatalf("reasoning stop event = %+v", events[1])
+	}
+}
+
+func TestAnthropicInboundOpenAIResponsesStreamRefusal(t *testing.T) {
+	bridge, ok := NewCrossFamilyBridge(ProtocolAnthropicMessages, "openai")
+	if !ok {
+		t.Fatal("NewCrossFamilyBridge() ok = false, want true")
+	}
+	decoder, err := bridge.NewStreamDecoder(StreamDecodeOptions{})
+	if err != nil {
+		t.Fatalf("NewStreamDecoder() error = %v", err)
+	}
+	encoder, err := bridge.NewStreamEncoder(StreamEncodeOptions{Model: "claude-sonnet"})
+	if err != nil {
+		t.Fatalf("NewStreamEncoder() error = %v", err)
+	}
+
+	events := make([]RawStreamEvent, 0)
+	for _, raw := range []RawStreamEvent{
+		{Event: "response.created", Data: []byte(`{"type":"response.created","response":{"id":"resp_1","status":"in_progress","model":"gpt-5.4"}}`)},
+		{Event: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","item":{"id":"msg_1","type":"message","role":"assistant","status":"in_progress"}}`)},
+		{Event: "response.content_part.added", Data: []byte(`{"type":"response.content_part.added","item_id":"msg_1","content_part":{"type":"refusal","text":""}}`)},
+		{Event: "response.refusal.delta", Data: []byte(`{"type":"response.refusal.delta","item_id":"msg_1","delta":"I can't help."}`)},
+		{Event: "response.refusal.done", Data: []byte(`{"type":"response.refusal.done","item_id":"msg_1"}`)},
+		{Event: "response.completed", Data: []byte(`{"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":10,"output_tokens":5}}}`)},
+	} {
+		parts, err := decoder.Decode(raw)
+		if err != nil {
+			t.Fatalf("Decode(%s) error = %v", raw.Event, err)
+		}
+		for _, part := range parts {
+			encoded, err := encoder.Encode(part)
+			if err != nil {
+				t.Fatalf("Encode(%s) error = %v", raw.Event, err)
+			}
+			events = append(events, encoded...)
+		}
+	}
+
+	var sawDelta bool
+	var finish anthropicStreamEvent
+	for _, event := range events {
+		var decoded anthropicStreamEvent
+		if err := json.Unmarshal(event.Data, &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(%s) error = %v", event.Event, err)
+		}
+		if decoded.Type == "content_block_delta" && decoded.Delta != nil && decoded.Delta.Text == "I can't help." {
+			sawDelta = true
+		}
+		if decoded.Type == "message_delta" {
+			finish = decoded
+		}
+	}
+	if !sawDelta {
+		t.Fatalf("refusal text delta not found, events = %+v", events)
+	}
+	if finish.Delta == nil || finish.Delta.StopReason != "refusal" {
+		t.Fatalf("finish = %+v", finish)
 	}
 }
 

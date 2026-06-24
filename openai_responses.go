@@ -573,7 +573,7 @@ func prefixedID(id string, prefix string) string {
 func decodeOpenAIResponsesReasoning(item openAIResponsesOutputItem) []Part {
 	decoded := make([]Part, 0, len(item.Summary)+len(item.Content))
 	if item.EncryptedContent != "" {
-		reasoning := &ReasoningPart{Redacted: item.EncryptedContent, Signature: item.EncryptedContent}
+		reasoning := &ReasoningPart{Signature: item.EncryptedContent}
 		for _, part := range item.Summary {
 			if part.Text != "" {
 				reasoning.Text += part.Text
@@ -1403,10 +1403,17 @@ type openAIResponsesAnnotation struct {
 }
 
 type openAIResponsesStreamDecoder struct {
-	started     bool
-	activeTools map[string]openAIResponsesStreamToolState
-	endedTools  map[string]bool
-	hasToolCall bool
+	started           bool
+	activeTextID      string
+	activeReasoningID string
+	startedText       map[string]bool
+	endedText         map[string]bool
+	startedReasoning  map[string]bool
+	endedReasoning    map[string]bool
+	activeTools       map[string]openAIResponsesStreamToolState
+	endedTools        map[string]bool
+	hasToolCall       bool
+	hasRefusal        bool
 }
 
 type openAIResponsesStreamToolState struct {
@@ -1446,9 +1453,9 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 		}
 		switch raw.Item.Type {
 		case "reasoning":
-			return []StreamPart{{Type: StreamReasoningStart, ID: raw.Item.ID, ProviderMetadata: map[string]any{"status": raw.Item.Status}}}, nil
+			return d.startReasoning(raw.Item.ID, map[string]any{"status": raw.Item.Status}), nil
 		case "message":
-			return []StreamPart{{Type: StreamTextStart, ID: raw.Item.ID, ProviderMetadata: map[string]any{"status": raw.Item.Status}}}, nil
+			return d.startText(raw.Item.ID, map[string]any{"status": raw.Item.Status}), nil
 		case "function_call":
 			d.setActiveTool(raw.Item.ID, raw.Item.CallID, raw.Item.Name, false)
 			d.hasToolCall = true
@@ -1466,18 +1473,31 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 		}
 		switch raw.ContentPart.Type {
 		case "reasoning_text", "summary_text":
-			return []StreamPart{{Type: StreamReasoningStart}}, nil
+			return d.startReasoning(raw.ItemID, nil), nil
 		case "output_text", "text":
-			return []StreamPart{{Type: StreamTextStart}}, nil
+			return d.startText(raw.ItemID, nil), nil
 		case "refusal":
-			return []StreamPart{{Type: StreamTextStart, ProviderMetadata: map[string]any{"refusal": true}}}, nil
+			d.hasRefusal = true
+			return d.startText(raw.ItemID, map[string]any{"refusal": true}), nil
 		default:
 			return nil, nil
 		}
 	case "response.output_text.delta":
-		return []StreamPart{{Type: StreamTextDelta, Delta: raw.Delta}}, nil
+		id := d.textID(raw.ItemID)
+		parts := d.startText(id, nil)
+		parts = append(parts, StreamPart{Type: StreamTextDelta, ID: id, Delta: raw.Delta})
+		return parts, nil
+	case "response.refusal.delta":
+		d.hasRefusal = true
+		id := d.textID(raw.ItemID)
+		parts := d.startText(id, map[string]any{"refusal": true})
+		parts = append(parts, StreamPart{Type: StreamTextDelta, ID: id, Delta: raw.Delta, ProviderMetadata: map[string]any{"refusal": true}})
+		return parts, nil
 	case "response.reasoning_summary_text.delta", "response.reasoning.delta", "response.reasoning_text.delta":
-		return []StreamPart{{Type: StreamReasoningDelta, Delta: raw.Delta}}, nil
+		id := d.reasoningID(raw.ItemID)
+		parts := d.startReasoning(id, nil)
+		parts = append(parts, StreamPart{Type: StreamReasoningDelta, ID: id, Delta: raw.Delta})
+		return parts, nil
 	case "response.function_call_arguments.delta":
 		delta := raw.Delta
 		if delta == "" {
@@ -1489,9 +1509,12 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 		state := d.activeTool(raw.ItemID)
 		return []StreamPart{{Type: StreamToolInputDelta, ID: raw.ItemID, ToolCallID: state.CallID, ToolName: state.Name, Delta: raw.Delta, ProviderMetadata: map[string]any{"custom_tool_call": true}}}, nil
 	case "response.output_text.done":
-		return []StreamPart{{Type: StreamTextEnd}}, nil
+		return d.endText(raw.ItemID), nil
+	case "response.refusal.done":
+		d.hasRefusal = true
+		return d.endText(raw.ItemID), nil
 	case "response.reasoning_summary_text.done", "response.reasoning.done", "response.reasoning_text.done":
-		return []StreamPart{{Type: StreamReasoningEnd}}, nil
+		return nil, nil
 	case "response.function_call_arguments.done":
 		state := d.activeTool(raw.ItemID)
 		d.clearActiveTool(raw.ItemID)
@@ -1510,9 +1533,17 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 		}
 		switch raw.Item.Type {
 		case "reasoning":
-			return []StreamPart{{Type: StreamReasoningEnd, ID: raw.Item.ID}}, nil
+			parts := make([]StreamPart, 0, 2)
+			if raw.Item.EncryptedContent != "" && !d.reasoningEnded(raw.Item.ID) {
+				parts = append(parts, StreamPart{Type: StreamReasoningDelta, ID: raw.Item.ID, ProviderMetadata: map[string]any{"signature": raw.Item.EncryptedContent}})
+			}
+			parts = append(parts, d.endReasoning(raw.Item.ID)...)
+			return parts, nil
 		case "message":
-			return []StreamPart{{Type: StreamTextEnd, ID: raw.Item.ID}}, nil
+			if openAIResponsesContentHasRefusal(raw.Item.Content) {
+				d.hasRefusal = true
+			}
+			return d.endText(raw.Item.ID), nil
 		case "function_call":
 			if d.toolEnded(raw.Item.ID) {
 				return nil, nil
@@ -1536,7 +1567,9 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 		if raw.Response != nil {
 			finish.ID = raw.Response.ID
 			finish.FinishReason = decodeOpenAIResponsesFinishReason(raw.Response.Status, raw.Response.IncompleteDetails)
-			if finish.FinishReason == FinishStop && d.hasToolCall {
+			if d.hasRefusal {
+				finish.FinishReason = FinishContentFilter
+			} else if finish.FinishReason == FinishStop && d.hasToolCall {
 				finish.FinishReason = FinishToolCalls
 			}
 			if raw.Response.Usage != nil {
@@ -1552,6 +1585,9 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 		if raw.Response != nil {
 			finish.ID = raw.Response.ID
 			finish.FinishReason = decodeOpenAIResponsesFinishReason(raw.Response.Status, raw.Response.IncompleteDetails)
+			if d.hasRefusal {
+				finish.FinishReason = FinishContentFilter
+			}
 			if raw.Response.Usage != nil {
 				finish.Usage = decodeOpenAIResponsesUsage(*raw.Response.Usage)
 			}
@@ -1566,6 +1602,101 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 	default:
 		return []StreamPart{{Type: StreamRaw, RawValue: raw}}, nil
 	}
+}
+
+func openAIResponsesContentHasRefusal(parts []openAIResponsesContentPart) bool {
+	for _, part := range parts {
+		if part.Type == "refusal" {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *openAIResponsesStreamDecoder) startText(itemID string, metadata map[string]any) []StreamPart {
+	itemID = d.textID(itemID)
+	if d.textStarted(itemID) {
+		return nil
+	}
+	if d.startedText == nil {
+		d.startedText = make(map[string]bool)
+	}
+	d.startedText[itemID] = true
+	d.activeTextID = itemID
+	return []StreamPart{{Type: StreamTextStart, ID: itemID, ProviderMetadata: metadata}}
+}
+
+func (d *openAIResponsesStreamDecoder) endText(itemID string) []StreamPart {
+	itemID = d.textID(itemID)
+	if d.textEnded(itemID) {
+		return nil
+	}
+	if d.endedText == nil {
+		d.endedText = make(map[string]bool)
+	}
+	d.endedText[itemID] = true
+	if d.activeTextID == itemID {
+		d.activeTextID = ""
+	}
+	return []StreamPart{{Type: StreamTextEnd, ID: itemID}}
+}
+
+func (d *openAIResponsesStreamDecoder) textID(itemID string) string {
+	if itemID != "" {
+		return itemID
+	}
+	return d.activeTextID
+}
+
+func (d *openAIResponsesStreamDecoder) textStarted(itemID string) bool {
+	return d.startedText != nil && d.startedText[itemID]
+}
+
+func (d *openAIResponsesStreamDecoder) textEnded(itemID string) bool {
+	return d.endedText != nil && d.endedText[itemID]
+}
+
+func (d *openAIResponsesStreamDecoder) startReasoning(itemID string, metadata map[string]any) []StreamPart {
+	itemID = d.reasoningID(itemID)
+	if d.reasoningStarted(itemID) {
+		return nil
+	}
+	if d.startedReasoning == nil {
+		d.startedReasoning = make(map[string]bool)
+	}
+	d.startedReasoning[itemID] = true
+	d.activeReasoningID = itemID
+	return []StreamPart{{Type: StreamReasoningStart, ID: itemID, ProviderMetadata: metadata}}
+}
+
+func (d *openAIResponsesStreamDecoder) endReasoning(itemID string) []StreamPart {
+	itemID = d.reasoningID(itemID)
+	if d.reasoningEnded(itemID) {
+		return nil
+	}
+	if d.endedReasoning == nil {
+		d.endedReasoning = make(map[string]bool)
+	}
+	d.endedReasoning[itemID] = true
+	if d.activeReasoningID == itemID {
+		d.activeReasoningID = ""
+	}
+	return []StreamPart{{Type: StreamReasoningEnd, ID: itemID}}
+}
+
+func (d *openAIResponsesStreamDecoder) reasoningID(itemID string) string {
+	if itemID != "" {
+		return itemID
+	}
+	return d.activeReasoningID
+}
+
+func (d *openAIResponsesStreamDecoder) reasoningStarted(itemID string) bool {
+	return d.startedReasoning != nil && d.startedReasoning[itemID]
+}
+
+func (d *openAIResponsesStreamDecoder) reasoningEnded(itemID string) bool {
+	return d.endedReasoning != nil && d.endedReasoning[itemID]
 }
 
 func (d *openAIResponsesStreamDecoder) setActiveTool(itemID string, callID string, name string, custom bool) {
