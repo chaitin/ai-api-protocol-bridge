@@ -530,6 +530,9 @@ func decodeOpenAIChatMessage(message openAIChatMessage) (Message, error) {
 	role := Role(message.Role)
 	decoded := Message{Role: role}
 
+	if strings.TrimSpace(message.Reasoning) != "" {
+		decoded.Parts = append(decoded.Parts, Part{Type: PartReasoning, Reasoning: &ReasoningPart{Text: message.Reasoning}})
+	}
 	if message.Content != nil {
 		parts, err := decodeOpenAIChatContent(asRawMessage(message.Content))
 		if err != nil {
@@ -1087,6 +1090,7 @@ func (r *openAIChatRequest) UnmarshalJSON(raw []byte) error {
 type openAIChatMessage struct {
 	Role       string               `json:"role"`
 	Content    any                  `json:"content,omitempty"`
+	Reasoning  string               `json:"reasoning_content,omitempty"`
 	Refusal    string               `json:"refusal,omitempty"`
 	ToolCalls  []openAIChatToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string               `json:"tool_call_id,omitempty"`
@@ -1096,6 +1100,7 @@ func (m *openAIChatMessage) UnmarshalJSON(raw []byte) error {
 	var decoded struct {
 		Role       string               `json:"role"`
 		Content    json.RawMessage      `json:"content"`
+		Reasoning  string               `json:"reasoning_content"`
 		Refusal    string               `json:"refusal"`
 		ToolCalls  []openAIChatToolCall `json:"tool_calls"`
 		ToolCallID string               `json:"tool_call_id"`
@@ -1105,6 +1110,7 @@ func (m *openAIChatMessage) UnmarshalJSON(raw []byte) error {
 	}
 	m.Role = decoded.Role
 	m.Content = decoded.Content
+	m.Reasoning = decoded.Reasoning
 	m.Refusal = decoded.Refusal
 	m.ToolCalls = decoded.ToolCalls
 	m.ToolCallID = decoded.ToolCallID

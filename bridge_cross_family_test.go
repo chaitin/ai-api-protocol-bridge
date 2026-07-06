@@ -705,6 +705,76 @@ func TestOpenAIChatToAnthropicBridgeDisablesThinkingForUnsignedToolContinuation(
 	}
 }
 
+func TestOpenAIResponsesToAnthropicBridgePreservesReasoningForToolContinuation(t *testing.T) {
+	adapter := NewOpenAIResponsesAdapter()
+	rawRequest := []byte(`{
+		"model":"gpt-5.4",
+		"max_output_tokens":4096,
+		"reasoning":{"effort":"medium"},
+		"input":[
+			{"type":"reasoning","id":"rs_1","status":"completed","encrypted_content":"enc_1","summary":[{"type":"summary_text","text":"Need the weather tool."}]},
+			{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"I will check the weather."}]},
+			{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"Hangzhou\"}","status":"completed"},
+			{"type":"function_call_output","call_id":"call_1","output":"Cloudy","status":"completed"}
+		]
+	}`)
+	req, err := adapter.DecodeRequest(rawRequest)
+	if err != nil {
+		t.Fatalf("DecodeRequest() error = %v", err)
+	}
+	bridge, ok := NewCrossFamilyBridge(ProtocolOpenAIResponses, "anthropic")
+	if !ok {
+		t.Fatal("NewCrossFamilyBridge() ok = false, want true")
+	}
+
+	raw, err := bridge.EncodeUpstreamRequest(req, EncodeRequestOptions{Model: "claude-sonnet"})
+	if err != nil {
+		t.Fatalf("EncodeUpstreamRequest() error = %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if decoded["thinking"] == nil {
+		t.Fatalf("thinking should remain enabled when signed reasoning history is present: %+v", decoded)
+	}
+	messages := decoded["messages"].([]any)
+	assistantContent := messages[0].(map[string]any)["content"].([]any)
+	if len(assistantContent) != 3 {
+		t.Fatalf("assistant content = %+v", assistantContent)
+	}
+	reasoningBlock := assistantContent[0].(map[string]any)
+	if reasoningBlock["type"] != "thinking" || reasoningBlock["thinking"] != "Need the weather tool." || reasoningBlock["signature"] != "enc_1" {
+		t.Fatalf("reasoning block = %+v", reasoningBlock)
+	}
+	if assistantContent[1].(map[string]any)["type"] != "text" || assistantContent[2].(map[string]any)["type"] != "tool_use" {
+		t.Fatalf("assistant content order = %+v", assistantContent)
+	}
+}
+
+func TestOpenAIChatDecodeRequestPreservesReasoningContentInCanonicalRequest(t *testing.T) {
+	req, err := NewOpenAIChatAdapter().DecodeRequest([]byte(`{
+		"model":"deepseek-v4-pro",
+		"messages":[
+			{"role":"assistant","reasoning_content":"Need the weather tool.","content":"I will check the weather."}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("DecodeRequest() error = %v", err)
+	}
+	if len(req.Prompt) != 1 || len(req.Prompt[0].Parts) != 2 {
+		t.Fatalf("prompt = %+v", req.Prompt)
+	}
+	reasoning := req.Prompt[0].Parts[0].Reasoning
+	if reasoning == nil || reasoning.Text != "Need the weather tool." {
+		t.Fatalf("reasoning = %+v", reasoning)
+	}
+	if req.Prompt[0].Parts[1].Text == nil || req.Prompt[0].Parts[1].Text.Text != "I will check the weather." {
+		t.Fatalf("text part = %+v", req.Prompt[0].Parts[1])
+	}
+}
+
 func TestAnthropicInboundOpenAIResponsesUpstreamStreamBridge(t *testing.T) {
 	bridge, ok := NewCrossFamilyBridge(ProtocolAnthropicMessages, "openai")
 	if !ok {

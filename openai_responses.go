@@ -257,13 +257,35 @@ func decodeOpenAIResponsesInput(raw json.RawMessage) ([]Message, error) {
 	}
 
 	decoded := make([]Message, 0, len(messages))
+	var pendingAssistant *Message
+	appendAssistantParts := func(parts []Part) {
+		if len(parts) == 0 {
+			return
+		}
+		if pendingAssistant == nil {
+			pendingAssistant = &Message{Role: RoleAssistant}
+		}
+		pendingAssistant.Parts = append(pendingAssistant.Parts, parts...)
+	}
+	flushAssistant := func() {
+		if pendingAssistant == nil || len(pendingAssistant.Parts) == 0 {
+			pendingAssistant = nil
+			return
+		}
+		decoded = append(decoded, *pendingAssistant)
+		pendingAssistant = nil
+	}
 	for _, message := range messages {
+		if message.Type == "reasoning" {
+			appendAssistantParts(decodeOpenAIResponsesReasoning(openAIResponsesOutputItemFromInputItem(message)))
+			continue
+		}
 		if message.Type == "function_call" {
 			toolCall, err := decodeOpenAIResponsesToolCall(openAIResponsesOutputItemFromInputItem(message))
 			if err != nil {
 				return nil, err
 			}
-			decoded = append(decoded, Message{Role: RoleAssistant, Parts: []Part{toolCall}})
+			appendAssistantParts([]Part{toolCall})
 			continue
 		}
 		if message.Type == "custom_tool_call" {
@@ -271,10 +293,11 @@ func decodeOpenAIResponsesInput(raw json.RawMessage) ([]Message, error) {
 			if err != nil {
 				return nil, err
 			}
-			decoded = append(decoded, Message{Role: RoleAssistant, Parts: []Part{toolCall}})
+			appendAssistantParts([]Part{toolCall})
 			continue
 		}
 		if message.Type == "function_call_output" {
+			flushAssistant()
 			decoded = append(decoded, Message{Role: RoleTool, Parts: []Part{decodeOpenAIResponsesToolResult(openAIResponsesOutputItemFromInputItem(message))}})
 			continue
 		}
@@ -285,8 +308,14 @@ func decodeOpenAIResponsesInput(raw json.RawMessage) ([]Message, error) {
 		if message.Role == "" && len(parts) == 0 {
 			continue
 		}
+		if Role(message.Role) == RoleAssistant {
+			appendAssistantParts(parts)
+			continue
+		}
+		flushAssistant()
 		decoded = append(decoded, Message{Role: Role(message.Role), Parts: parts})
 	}
+	flushAssistant()
 	return decoded, nil
 }
 
@@ -874,11 +903,11 @@ func encodeOpenAIResponsesToolCalls(parts []Part) []openAIResponsesInputItem {
 }
 
 func openAIResponsesOutputItemFromInputItem(item openAIResponsesInputItem) openAIResponsesOutputItem {
-	return openAIResponsesOutputItem{ID: item.ID, Type: item.Type, Role: item.Role, Status: item.Status, CallID: item.CallID, Name: item.Name, Arguments: item.Arguments, Input: item.Input, Output: item.Output, EncryptedContent: item.EncryptedContent}
+	return openAIResponsesOutputItem{ID: item.ID, Type: item.Type, Role: item.Role, Status: item.Status, Summary: item.Summary, CallID: item.CallID, Name: item.Name, Arguments: item.Arguments, Input: item.Input, Output: item.Output, EncryptedContent: item.EncryptedContent}
 }
 
 func openAIResponsesInputItemFromOutputItem(item openAIResponsesOutputItem) openAIResponsesInputItem {
-	return openAIResponsesInputItem{ID: item.ID, Type: item.Type, Role: item.Role, Status: item.Status, CallID: item.CallID, Name: item.Name, Arguments: item.Arguments, Input: item.Input, Output: item.Output, EncryptedContent: item.EncryptedContent}
+	return openAIResponsesInputItem{ID: item.ID, Type: item.Type, Role: item.Role, Status: item.Status, Summary: item.Summary, CallID: item.CallID, Name: item.Name, Arguments: item.Arguments, Input: item.Input, Output: item.Output, EncryptedContent: item.EncryptedContent}
 }
 
 func encodeOpenAIResponsesResponseToolCalls(parts []Part, reason FinishReason) []openAIResponsesOutputItem {
@@ -1186,17 +1215,18 @@ type openAIResponsesInputItem struct {
 
 func (m *openAIResponsesInputItem) UnmarshalJSON(raw []byte) error {
 	var decoded struct {
-		ID               string                    `json:"id"`
-		Type             string                    `json:"type"`
-		Role             string                    `json:"role"`
-		Content          json.RawMessage           `json:"content"`
-		CallID           string                    `json:"call_id"`
-		Name             string                    `json:"name"`
-		Arguments        *openAIResponsesArguments `json:"arguments"`
-		Input            json.RawMessage           `json:"input"`
-		Output           json.RawMessage           `json:"output"`
-		Status           string                    `json:"status"`
-		EncryptedContent string                    `json:"encrypted_content"`
+		ID               string                       `json:"id"`
+		Type             string                       `json:"type"`
+		Role             string                       `json:"role"`
+		Content          json.RawMessage              `json:"content"`
+		Summary          []openAIResponsesContentPart `json:"summary"`
+		CallID           string                       `json:"call_id"`
+		Name             string                       `json:"name"`
+		Arguments        *openAIResponsesArguments    `json:"arguments"`
+		Input            json.RawMessage              `json:"input"`
+		Output           json.RawMessage              `json:"output"`
+		Status           string                       `json:"status"`
+		EncryptedContent string                       `json:"encrypted_content"`
 	}
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		return err
@@ -1205,6 +1235,7 @@ func (m *openAIResponsesInputItem) UnmarshalJSON(raw []byte) error {
 	m.Type = decoded.Type
 	m.Role = decoded.Role
 	m.Content = decoded.Content
+	m.Summary = decoded.Summary
 	m.CallID = decoded.CallID
 	m.Name = decoded.Name
 	m.Arguments = decoded.Arguments
