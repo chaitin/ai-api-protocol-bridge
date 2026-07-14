@@ -1,6 +1,7 @@
 package protocolbridge
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -94,7 +95,7 @@ func anthropicBridgeInputItemsForMessage(message Message) []openAIResponsesInput
 				if strings.TrimSpace(part.Reasoning.Text) != "" {
 					summary = append(summary, openAIResponsesContentPart{Type: "summary_text", Text: part.Reasoning.Text})
 				}
-				items = append(items, openAIResponsesInputItem{Type: "reasoning", Summary: summary, EncryptedContent: encrypted})
+				items = append(items, openAIResponsesInputItem{ID: openAIResponsesReasoningItemID(encrypted), Type: "reasoning", Summary: summary, EncryptedContent: encrypted})
 			}
 		case PartText:
 			if part.Text == nil {
@@ -162,6 +163,11 @@ func anthropicBridgeInputItemsForMessage(message Message) []openAIResponsesInput
 	}
 
 	return items
+}
+
+func openAIResponsesReasoningItemID(encryptedContent string) string {
+	digest := sha256.Sum256([]byte(encryptedContent))
+	return fmt.Sprintf("rs_%x", digest)
 }
 
 type openAIResponsesToAnthropicStreamEncoder struct {

@@ -1209,7 +1209,7 @@ type openAIResponsesInputItem struct {
 	Input            any                          `json:"input,omitempty"`
 	Output           any                          `json:"output,omitempty"`
 	Status           string                       `json:"status,omitempty"`
-	Summary          []openAIResponsesContentPart `json:"summary,omitempty"`
+	Summary          []openAIResponsesContentPart `json:"summary,omitzero"`
 	EncryptedContent string                       `json:"encrypted_content,omitempty"`
 }
 

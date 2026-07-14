@@ -113,6 +113,98 @@ func TestAnthropicToOpenAIResponsesBridgeEncodeUpstreamRequest(t *testing.T) {
 	}
 }
 
+func TestAnthropicToOpenAIResponsesBridgePreservesEmptyReasoningSummary(t *testing.T) {
+	bridge, ok := NewCrossFamilyBridge(ProtocolAnthropicMessages, "openai")
+	if !ok {
+		t.Fatal("NewCrossFamilyBridge() ok = false, want true")
+	}
+
+	tests := []struct {
+		name             string
+		content          string
+		encryptedContent string
+		reasoningID      string
+	}{
+		{
+			name:             "omitted thinking",
+			content:          `[{"type":"thinking","thinking":"","signature":"sig_omitted"},{"type":"text","text":"answer"}]`,
+			encryptedContent: "sig_omitted",
+			reasoningID:      "rs_ba7d9f29b4a92e1ee9392d44166a85d6c870be0b642bacf3f33f877c4b1fec26",
+		},
+		{
+			name:             "redacted thinking",
+			content:          `[{"type":"redacted_thinking","data":"encrypted_redacted"},{"type":"text","text":"answer"}]`,
+			encryptedContent: "encrypted_redacted",
+			reasoningID:      "rs_e0b6c818077e13f6c87efe822396461444f93de7062f06fc38d00a4c5a7a0a29",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rawRequest := []byte(`{"model":"claude","max_tokens":128,"messages":[{"role":"user","content":"start"},{"role":"assistant","content":` + tt.content + `},{"role":"user","content":"continue"}]}`)
+			req, err := NewAnthropicMessagesAdapter().DecodeRequest(rawRequest)
+			if err != nil {
+				t.Fatalf("DecodeRequest() error = %v", err)
+			}
+
+			rawUpstream, err := bridge.EncodeUpstreamRequest(req, EncodeRequestOptions{Model: "gpt-5.4"})
+			if err != nil {
+				t.Fatalf("EncodeUpstreamRequest() error = %v", err)
+			}
+
+			var upstream struct {
+				Input []map[string]json.RawMessage `json:"input"`
+			}
+			if err := json.Unmarshal(rawUpstream, &upstream); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v", err)
+			}
+			if len(upstream.Input) != 4 {
+				t.Fatalf("input = %s", rawUpstream)
+			}
+
+			var reasoning map[string]json.RawMessage
+			for _, item := range upstream.Input {
+				var itemType string
+				if err := json.Unmarshal(item["type"], &itemType); err != nil {
+					t.Fatalf("decode input item type: %v; item = %s", err, mustMarshalJSON(item))
+				}
+				if itemType == "reasoning" {
+					reasoning = item
+					continue
+				}
+				if _, exists := item["summary"]; exists {
+					t.Fatalf("%s item unexpectedly contains summary: %s", itemType, mustMarshalJSON(item))
+				}
+			}
+			if reasoning == nil {
+				t.Fatalf("reasoning item not found: %s", rawUpstream)
+			}
+			if got := string(reasoning["summary"]); got != "[]" {
+				t.Fatalf("reasoning summary = %s, want []; item = %s", got, mustMarshalJSON(reasoning))
+			}
+			var itemID string
+			if err := json.Unmarshal(reasoning["id"], &itemID); err != nil {
+				t.Fatalf("decode reasoning id: %v", err)
+			}
+			if itemID != tt.reasoningID {
+				t.Fatalf("reasoning id = %q, want %q", itemID, tt.reasoningID)
+			}
+			var encryptedContent string
+			if err := json.Unmarshal(reasoning["encrypted_content"], &encryptedContent); err != nil {
+				t.Fatalf("decode encrypted_content: %v", err)
+			}
+			if encryptedContent != tt.encryptedContent {
+				t.Fatalf("encrypted_content = %q, want %q", encryptedContent, tt.encryptedContent)
+			}
+		})
+	}
+}
+
+func mustMarshalJSON(value any) string {
+	raw, _ := json.Marshal(value)
+	return string(raw)
+}
+
 func TestAnthropicToOpenAIResponsesBridgeDecodeUpstreamResponse(t *testing.T) {
 	bridge, ok := NewCrossFamilyBridge(ProtocolAnthropicMessages, "openai")
 	if !ok {
