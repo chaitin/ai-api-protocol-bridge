@@ -458,7 +458,7 @@ func TestOpenAIResponsesDecodeResponse(t *testing.T) {
 		"status":"completed",
 		"model":"gpt-5.4",
 		"output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"I should answer briefly."}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello back"}]},{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"Shanghai\"}","status":"completed"},{"type":"function_call_output","call_id":"call_1","output":"Sunny","status":"completed"}],
-		"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}
+		"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15,"input_tokens_details":{"cache_write_tokens":2,"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}
 	}`)
 
 	resp, err := adapter.DecodeResponse(raw)
@@ -474,7 +474,7 @@ func TestOpenAIResponsesDecodeResponse(t *testing.T) {
 	if resp.FinishReason != FinishToolCalls {
 		t.Fatalf("FinishReason = %q", resp.FinishReason)
 	}
-	if *resp.Usage.InputTokens != 10 || *resp.Usage.OutputTokens != 5 || *resp.Usage.CachedInputTokens != 3 || *resp.Usage.ReasoningTokens != 2 {
+	if *resp.Usage.InputTokens != 10 || *resp.Usage.OutputTokens != 5 || *resp.Usage.CachedInputTokens != 3 || *resp.Usage.CacheCreationInputTokens != 2 || *resp.Usage.ReasoningTokens != 2 {
 		t.Fatalf("usage = %+v", resp.Usage)
 	}
 	billingUsage := resp.BillingUsage()
@@ -675,6 +675,7 @@ func TestOpenAIResponsesEncodeResponse(t *testing.T) {
 	inputTokens := 10
 	outputTokens := 5
 	cachedInputTokens := 3
+	cacheWriteTokens := 0
 	totalInputTokens := inputTokens + cachedInputTokens
 	reasoningTokens := 2
 	resp := &LLMResponse{
@@ -689,7 +690,7 @@ func TestOpenAIResponsesEncodeResponse(t *testing.T) {
 			{Type: PartToolResult, ToolResult: &ToolResultPart{ToolCallID: "call_1", Output: ToolResultOutput{Type: ToolResultContent, Content: []Part{{Type: PartText, Text: &TextPart{Text: "Sunny"}}, {Type: PartText, Text: &TextPart{Text: "Windy"}}}}}},
 		},
 		FinishReason: FinishStop,
-		Usage:        Usage{InputTokens: &totalInputTokens, OutputTokens: &outputTokens, CachedInputTokens: &cachedInputTokens, ReasoningTokens: &reasoningTokens},
+		Usage:        Usage{InputTokens: &totalInputTokens, OutputTokens: &outputTokens, CachedInputTokens: &cachedInputTokens, CacheCreationInputTokens: &cacheWriteTokens, ReasoningTokens: &reasoningTokens},
 	}
 
 	raw, err := adapter.EncodeResponse(resp, EncodeResponseOptions{Model: "gpt-5.4"})
@@ -739,7 +740,7 @@ func TestOpenAIResponsesEncodeResponse(t *testing.T) {
 		t.Fatalf("usage = %+v", usage)
 	}
 	inputDetails := usage["input_tokens_details"].(map[string]any)
-	if inputDetails["cached_tokens"] != float64(3) {
+	if inputDetails["cached_tokens"] != float64(3) || inputDetails["cache_write_tokens"] != float64(0) {
 		t.Fatalf("input_tokens_details = %+v", inputDetails)
 	}
 	outputDetails := usage["output_tokens_details"].(map[string]any)

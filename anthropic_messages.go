@@ -1181,7 +1181,7 @@ func decodeAnthropicUsage(usage anthropicUsage) Usage {
 
 func encodeAnthropicUsage(usage Usage, billingUsage BillingUsage) anthropicUsage {
 	if hasBillingUsage(billingUsage) {
-		inputTokens := billingUsage.InputTokens
+		inputTokens := clampNonNegative(billingUsage.InputTokens - intValue(usage.CacheCreationInputTokens))
 		cachedInputTokens := billingUsage.CachedInputTokens
 		outputTokens := billingUsage.OutputTokens
 		return anthropicUsage{InputTokens: &inputTokens, OutputTokens: &outputTokens, CacheCreationInputTokens: usage.CacheCreationInputTokens, CacheReadInputTokens: &cachedInputTokens}

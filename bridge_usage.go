@@ -19,17 +19,16 @@ func anthropicUsageToResponsesUsage(usage Usage) Usage {
 		converted.CachedInputTokens = nil
 	}
 	converted.CacheReadInputTokens = nil
-	converted.CacheCreationInputTokens = nil
 	return converted
 }
 
 func responsesUsageToAnthropicUsage(usage Usage) Usage {
 	converted := usage
 	cached := intValue(usage.CachedInputTokens)
-	input := clampNonNegative(intValue(usage.InputTokens) - cached)
+	cacheWrite := intValue(usage.CacheCreationInputTokens)
+	input := clampNonNegative(intValue(usage.InputTokens) - cached - cacheWrite)
 	convertedInput := input
 	converted.InputTokens = &convertedInput
 	converted.CacheReadInputTokens = usage.CachedInputTokens
-	converted.CacheCreationInputTokens = nil
 	return converted
 }

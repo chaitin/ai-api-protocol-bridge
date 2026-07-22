@@ -222,7 +222,7 @@ func TestAnthropicToOpenAIResponsesBridgeDecodeUpstreamResponse(t *testing.T) {
 			{"type":"function_call","call_id":"toolu_1","name":"get_weather","arguments":"{\"city\":\"Shanghai\"}","status":"completed"},
 			{"type":"function_call_output","call_id":"toolu_1","output":"failed","status":"completed"}
 		],
-		"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}
+		"usage":{"input_tokens":17,"output_tokens":5,"total_tokens":22,"input_tokens_details":{"cache_write_tokens":3,"cached_tokens":4},"output_tokens_details":{"reasoning_tokens":2}}
 	}`)
 
 	resp, err := bridge.DecodeUpstreamResponse(raw)
@@ -242,8 +242,20 @@ func TestAnthropicToOpenAIResponsesBridgeDecodeUpstreamResponse(t *testing.T) {
 		t.Fatalf("tool result = %+v", resp.Content[3])
 	}
 	billingUsage := resp.BillingUsage()
-	if billingUsage.InputTokens != 7 || billingUsage.CachedInputTokens != 3 || billingUsage.OutputTokens != 5 {
+	if billingUsage.InputTokens != 13 || billingUsage.CachedInputTokens != 4 || billingUsage.OutputTokens != 5 {
 		t.Fatalf("billing usage = %+v", billingUsage)
+	}
+
+	encoded, err := NewAnthropicMessagesAdapter().EncodeResponse(resp, EncodeResponseOptions{Model: "claude-sonnet"})
+	if err != nil {
+		t.Fatalf("EncodeResponse() error = %v", err)
+	}
+	var clientResponse anthropicResponse
+	if err := json.Unmarshal(encoded, &clientResponse); err != nil {
+		t.Fatalf("json.Unmarshal(encoded) error = %v", err)
+	}
+	if clientResponse.Usage.InputTokens == nil || *clientResponse.Usage.InputTokens != 10 || clientResponse.Usage.CacheCreationInputTokens == nil || *clientResponse.Usage.CacheCreationInputTokens != 3 || clientResponse.Usage.CacheReadInputTokens == nil || *clientResponse.Usage.CacheReadInputTokens != 4 {
+		t.Fatalf("client response usage = %+v", clientResponse.Usage)
 	}
 }
 
@@ -520,6 +532,31 @@ func TestOpenAIResponsesToAnthropicBridgeDecodeUpstreamResponse(t *testing.T) {
 		t.Fatalf("reasoning = %+v", resp.Content[0])
 	}
 	billingUsage := resp.BillingUsage()
+	if billingUsage.InputTokens != 13 || billingUsage.CachedInputTokens != 4 || billingUsage.OutputTokens != 5 {
+		t.Fatalf("billing usage = %+v", billingUsage)
+	}
+	if resp.Usage.InputTokens == nil || *resp.Usage.InputTokens != 17 || resp.Usage.CacheCreationInputTokens == nil || *resp.Usage.CacheCreationInputTokens != 3 || resp.Usage.CachedInputTokens == nil || *resp.Usage.CachedInputTokens != 4 {
+		t.Fatalf("usage = %+v", resp.Usage)
+	}
+}
+
+func TestResponsesUsageToAnthropicUsagePreservesCacheWrite(t *testing.T) {
+	inputTokens := 17
+	outputTokens := 5
+	cachedTokens := 4
+	cacheWriteTokens := 3
+
+	usage := responsesUsageToAnthropicUsage(Usage{
+		InputTokens:              &inputTokens,
+		OutputTokens:             &outputTokens,
+		CachedInputTokens:        &cachedTokens,
+		CacheCreationInputTokens: &cacheWriteTokens,
+	})
+
+	if usage.InputTokens == nil || *usage.InputTokens != 10 || usage.CacheReadInputTokens == nil || *usage.CacheReadInputTokens != 4 || usage.CacheCreationInputTokens == nil || *usage.CacheCreationInputTokens != 3 {
+		t.Fatalf("usage = %+v", usage)
+	}
+	billingUsage := billingUsageForProtocol(ProtocolAnthropicMessages, usage)
 	if billingUsage.InputTokens != 13 || billingUsage.CachedInputTokens != 4 || billingUsage.OutputTokens != 5 {
 		t.Fatalf("billing usage = %+v", billingUsage)
 	}
@@ -881,7 +918,7 @@ func TestAnthropicInboundOpenAIResponsesUpstreamStreamBridge(t *testing.T) {
 		t.Fatalf("NewStreamEncoder() error = %v", err)
 	}
 
-	parts, err := decoder.Decode(RawStreamEvent{Event: "response.created", Data: []byte(`{"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress","model":"gpt-5.4","usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":3},"output_tokens":0}}}`)})
+	parts, err := decoder.Decode(RawStreamEvent{Event: "response.created", Data: []byte(`{"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress","model":"gpt-5.4","usage":{"input_tokens":17,"input_tokens_details":{"cache_write_tokens":3,"cached_tokens":4},"output_tokens":0}}}`)})
 	if err != nil {
 		t.Fatalf("Decode(response.created) error = %v", err)
 	}
@@ -893,11 +930,11 @@ func TestAnthropicInboundOpenAIResponsesUpstreamStreamBridge(t *testing.T) {
 	if err := json.Unmarshal(startEvents[0].Data, &start); err != nil {
 		t.Fatalf("json.Unmarshal(start) error = %v", err)
 	}
-	if start.Type != "message_start" || start.Message == nil || start.Message.Usage.InputTokens == nil || *start.Message.Usage.InputTokens != 7 {
+	if start.Type != "message_start" || start.Message == nil || start.Message.Usage.InputTokens == nil || *start.Message.Usage.InputTokens != 10 {
 		t.Fatalf("start = %+v", start)
 	}
-	if start.Message.Usage.CacheReadInputTokens == nil || *start.Message.Usage.CacheReadInputTokens != 3 {
-		t.Fatalf("start cache read = %+v", start.Message.Usage)
+	if start.Message.Usage.CacheCreationInputTokens == nil || *start.Message.Usage.CacheCreationInputTokens != 3 || start.Message.Usage.CacheReadInputTokens == nil || *start.Message.Usage.CacheReadInputTokens != 4 {
+		t.Fatalf("start cache usage = %+v", start.Message.Usage)
 	}
 
 	parts, err = decoder.Decode(RawStreamEvent{Event: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning","status":"in_progress"}}`)})
@@ -964,7 +1001,7 @@ func TestAnthropicInboundOpenAIResponsesUpstreamStreamBridge(t *testing.T) {
 		t.Fatalf("toolDelta = %+v", toolDelta)
 	}
 
-	parts, err = decoder.Decode(RawStreamEvent{Event: "response.completed", Data: []byte(`{"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":3},"output_tokens":5}}}`)})
+	parts, err = decoder.Decode(RawStreamEvent{Event: "response.completed", Data: []byte(`{"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":17,"input_tokens_details":{"cache_write_tokens":3,"cached_tokens":4},"output_tokens":5}}}`)})
 	if err != nil {
 		t.Fatalf("Decode(response.completed) error = %v", err)
 	}
@@ -976,10 +1013,10 @@ func TestAnthropicInboundOpenAIResponsesUpstreamStreamBridge(t *testing.T) {
 	if err := json.Unmarshal(finishEvents[0].Data, &finish); err != nil {
 		t.Fatalf("json.Unmarshal(finish) error = %v", err)
 	}
-	if finish.Type != "message_delta" || finish.Usage == nil || finish.Usage.InputTokens == nil || *finish.Usage.InputTokens != 7 {
+	if finish.Type != "message_delta" || finish.Usage == nil || finish.Usage.InputTokens == nil || *finish.Usage.InputTokens != 10 {
 		t.Fatalf("finish = %+v", finish)
 	}
-	if finish.Usage.CacheReadInputTokens == nil || *finish.Usage.CacheReadInputTokens != 3 || finish.Usage.OutputTokens == nil || *finish.Usage.OutputTokens != 5 {
+	if finish.Usage.CacheCreationInputTokens == nil || *finish.Usage.CacheCreationInputTokens != 3 || finish.Usage.CacheReadInputTokens == nil || *finish.Usage.CacheReadInputTokens != 4 || finish.Usage.OutputTokens == nil || *finish.Usage.OutputTokens != 5 {
 		t.Fatalf("finish usage = %+v", finish.Usage)
 	}
 }
@@ -1214,6 +1251,9 @@ func TestOpenAIResponsesInboundAnthropicUpstreamStreamBridge(t *testing.T) {
 	if start.Response.Usage.InputTokensDetails == nil || start.Response.Usage.InputTokensDetails.CachedTokens == nil || *start.Response.Usage.InputTokensDetails.CachedTokens != 4 {
 		t.Fatalf("start usage = %+v", start.Response.Usage)
 	}
+	if start.Response.Usage.InputTokensDetails.CacheWriteTokens == nil || *start.Response.Usage.InputTokensDetails.CacheWriteTokens != 3 {
+		t.Fatalf("start cache write usage = %+v", start.Response.Usage)
+	}
 
 	parts, err = decoder.Decode(RawStreamEvent{Event: "content_block_start", Data: []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}`)})
 	if err != nil {
@@ -1290,6 +1330,9 @@ func TestOpenAIResponsesInboundAnthropicUpstreamStreamBridge(t *testing.T) {
 	}
 	if finish.Response.Usage.OutputTokens == nil || *finish.Response.Usage.OutputTokens != 5 {
 		t.Fatalf("finish usage = %+v", finish.Response.Usage)
+	}
+	if finish.Response.Usage.InputTokensDetails == nil || finish.Response.Usage.InputTokensDetails.CachedTokens == nil || *finish.Response.Usage.InputTokensDetails.CachedTokens != 4 || finish.Response.Usage.InputTokensDetails.CacheWriteTokens == nil || *finish.Response.Usage.InputTokensDetails.CacheWriteTokens != 3 {
+		t.Fatalf("finish input token details = %+v", finish.Response.Usage)
 	}
 }
 

@@ -1025,6 +1025,7 @@ func decodeOpenAIResponsesUsage(usage openAIResponsesUsage) Usage {
 	decoded := Usage{InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens}
 	if usage.InputTokensDetails != nil {
 		decoded.CachedInputTokens = usage.InputTokensDetails.CachedTokens
+		decoded.CacheCreationInputTokens = usage.InputTokensDetails.CacheWriteTokens
 	}
 	if usage.OutputTokensDetails != nil {
 		decoded.ReasoningTokens = usage.OutputTokensDetails.ReasoningTokens
@@ -1078,8 +1079,11 @@ func encodeOpenAIResponsesUsage(usage Usage, billingUsage BillingUsage) openAIRe
 		outputTokens := billingUsage.OutputTokens
 		cachedInputTokens := billingUsage.CachedInputTokens
 		encoded := openAIResponsesUsage{InputTokens: &inputTokens, OutputTokens: &outputTokens, TotalTokens: calculateTotalTokens(&inputTokens, &outputTokens)}
-		if cachedInputTokens > 0 {
-			encoded.InputTokensDetails = &openAIResponsesInputTokensDetails{CachedTokens: &cachedInputTokens}
+		if usage.CachedInputTokens != nil || usage.CacheCreationInputTokens != nil {
+			encoded.InputTokensDetails = &openAIResponsesInputTokensDetails{CacheWriteTokens: usage.CacheCreationInputTokens}
+			if usage.CachedInputTokens != nil {
+				encoded.InputTokensDetails.CachedTokens = &cachedInputTokens
+			}
 		}
 		if usage.ReasoningTokens != nil {
 			encoded.OutputTokensDetails = &openAIResponsesOutputTokensDetails{ReasoningTokens: usage.ReasoningTokens}
@@ -1087,8 +1091,11 @@ func encodeOpenAIResponsesUsage(usage Usage, billingUsage BillingUsage) openAIRe
 		return encoded
 	}
 	encoded := openAIResponsesUsage{InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens, TotalTokens: calculateTotalTokens(usage.InputTokens, usage.OutputTokens)}
-	if usage.CachedInputTokens != nil {
-		encoded.InputTokensDetails = &openAIResponsesInputTokensDetails{CachedTokens: usage.CachedInputTokens}
+	if usage.CachedInputTokens != nil || usage.CacheCreationInputTokens != nil {
+		encoded.InputTokensDetails = &openAIResponsesInputTokensDetails{
+			CachedTokens:     usage.CachedInputTokens,
+			CacheWriteTokens: usage.CacheCreationInputTokens,
+		}
 	}
 	if usage.ReasoningTokens != nil {
 		encoded.OutputTokensDetails = &openAIResponsesOutputTokensDetails{ReasoningTokens: usage.ReasoningTokens}
@@ -1358,9 +1365,10 @@ type openAIResponsesUsage struct {
 }
 
 type openAIResponsesInputTokensDetails struct {
-	CachedTokens *int `json:"cached_tokens,omitempty"`
-	TextTokens   *int `json:"text_tokens,omitempty"`
-	ImageTokens  *int `json:"image_tokens,omitempty"`
+	CachedTokens     *int `json:"cached_tokens,omitempty"`
+	CacheWriteTokens *int `json:"cache_write_tokens,omitempty"`
+	TextTokens       *int `json:"text_tokens,omitempty"`
+	ImageTokens      *int `json:"image_tokens,omitempty"`
 }
 
 type openAIResponsesOutputTokensDetails struct {
