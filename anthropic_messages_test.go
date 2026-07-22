@@ -663,6 +663,9 @@ func TestAnthropicMessagesStreamDecoder(t *testing.T) {
 	if len(parts) != 1 || parts[0].Type != StreamFinish || parts[0].FinishReason != FinishStop || parts[0].Usage.OutputTokens == nil || *parts[0].Usage.OutputTokens != 5 {
 		t.Fatalf("message_delta parts = %+v", parts)
 	}
+	if parts[0].Usage.InputTokens == nil || *parts[0].Usage.InputTokens != 10 || parts[0].Usage.CacheReadInputTokens == nil || *parts[0].Usage.CacheReadInputTokens != 3 {
+		t.Fatalf("message_delta merged usage = %+v", parts[0].Usage)
+	}
 }
 
 func TestAnthropicMessagesStreamEncoder(t *testing.T) {

@@ -1022,6 +1022,86 @@ func TestOpenAIResponsesStreamDecoderMergesImageGenerationUsage(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesStreamDecoderKeepsImageGenerationUsageFromOutputItemDone(t *testing.T) {
+	decoder, err := NewOpenAIResponsesAdapter().NewStreamDecoder(StreamDecodeOptions{})
+	if err != nil {
+		t.Fatalf("NewStreamDecoder() error = %v", err)
+	}
+
+	parts, err := decoder.Decode(RawStreamEvent{Event: "response.output_item.done", Data: []byte(`{
+		"type":"response.output_item.done",
+		"output_index":0,
+		"item":{
+			"id":"ig_1",
+			"type":"image_generation_call",
+			"usage":{
+				"input_tokens_details":{"text_tokens":2,"image_tokens":5},
+				"output_tokens_details":{"image_tokens":11}
+			}
+		}
+	}`)})
+	if err != nil {
+		t.Fatalf("Decode(output item done) error = %v", err)
+	}
+	if len(parts) != 0 {
+		t.Fatalf("output item done parts = %+v", parts)
+	}
+
+	parts, err = decoder.Decode(RawStreamEvent{Event: "response.completed", Data: []byte(`{
+		"type":"response.completed",
+		"response":{
+			"id":"resp_1",
+			"status":"completed",
+			"usage":{"input_tokens":10,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}}
+		}
+	}`)})
+	if err != nil {
+		t.Fatalf("Decode(completed) error = %v", err)
+	}
+	if len(parts) != 1 || parts[0].Type != StreamFinish {
+		t.Fatalf("completed parts = %+v", parts)
+	}
+	billingUsage := billingUsageForProtocol(ProtocolOpenAIResponses, parts[0].Usage)
+	if billingUsage.InputTokens != 13 || billingUsage.CachedInputTokens != 4 || billingUsage.OutputTokens != 14 {
+		t.Fatalf("billing usage = %+v", billingUsage)
+	}
+}
+
+func TestOpenAIResponsesStreamDecoderDoesNotDoubleCountRememberedImageGenerationUsage(t *testing.T) {
+	decoder, err := NewOpenAIResponsesAdapter().NewStreamDecoder(StreamDecodeOptions{})
+	if err != nil {
+		t.Fatalf("NewStreamDecoder() error = %v", err)
+	}
+
+	if _, err := decoder.Decode(RawStreamEvent{Event: "response.output_item.done", Data: []byte(`{
+		"type":"response.output_item.done",
+		"output_index":0,
+		"item":{"id":"ig_1","type":"image_generation_call","usage":{"input_tokens":7,"output_tokens":11}}
+	}`)}); err != nil {
+		t.Fatalf("Decode(output item done) error = %v", err)
+	}
+
+	parts, err := decoder.Decode(RawStreamEvent{Event: "response.completed", Data: []byte(`{
+		"type":"response.completed",
+		"response":{
+			"id":"resp_1",
+			"status":"completed",
+			"usage":{"input_tokens":10,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}},
+			"output":[{"id":"ig_1","type":"image_generation_call","usage":{"input_tokens":7,"output_tokens":11}}]
+		}
+	}`)})
+	if err != nil {
+		t.Fatalf("Decode(completed) error = %v", err)
+	}
+	if len(parts) != 1 || parts[0].Type != StreamFinish {
+		t.Fatalf("completed parts = %+v", parts)
+	}
+	billingUsage := billingUsageForProtocol(ProtocolOpenAIResponses, parts[0].Usage)
+	if billingUsage.InputTokens != 13 || billingUsage.CachedInputTokens != 4 || billingUsage.OutputTokens != 14 {
+		t.Fatalf("billing usage = %+v", billingUsage)
+	}
+}
+
 func TestOpenAIResponsesStreamDecoderDoesNotDoubleCountDuplicateImageGenerationOutput(t *testing.T) {
 	decoder, err := NewOpenAIResponsesAdapter().NewStreamDecoder(StreamDecodeOptions{})
 	if err != nil {

@@ -214,6 +214,7 @@ func decodeAnthropicMessage(message anthropicMessage) (Message, error) {
 type anthropicStreamDecoder struct {
 	blockTypes map[int]StreamPartType
 	toolIDs    map[int]string
+	usage      Usage
 }
 
 func (d *anthropicStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, error) {
@@ -231,7 +232,8 @@ func (d *anthropicStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, err
 		part := StreamPart{Type: StreamStart}
 		if raw.Message != nil {
 			part.ID = raw.Message.ID
-			part.Usage = decodeAnthropicUsage(raw.Message.Usage)
+			mergeUsage(&d.usage, decodeAnthropicUsage(raw.Message.Usage))
+			part.Usage = d.usage
 			part.ProviderMetadata = map[string]any{"model": raw.Message.Model, "role": raw.Message.Role}
 		}
 		return []StreamPart{part}, nil
@@ -255,7 +257,8 @@ func (d *anthropicStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, err
 		if raw.Usage != nil {
 			usage = *raw.Usage
 		}
-		finish := StreamPart{Type: StreamFinish, FinishReason: decodeAnthropicStopReason(raw.Delta.StopReason), Usage: decodeAnthropicUsage(usage)}
+		mergeUsage(&d.usage, decodeAnthropicUsage(usage))
+		finish := StreamPart{Type: StreamFinish, FinishReason: decodeAnthropicStopReason(raw.Delta.StopReason), Usage: d.usage}
 		return []StreamPart{finish}, nil
 	case "message_stop":
 		return nil, nil

@@ -1270,7 +1270,7 @@ func TestOpenAIResponsesInboundAnthropicUpstreamStreamBridge(t *testing.T) {
 		t.Fatalf("toolDelta = %+v", toolDelta)
 	}
 
-	parts, err = decoder.Decode(RawStreamEvent{Event: "message_delta", Data: []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":4,"output_tokens":5}}`)})
+	parts, err = decoder.Decode(RawStreamEvent{Event: "message_delta", Data: []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}`)})
 	if err != nil {
 		t.Fatalf("Decode(message_delta) error = %v", err)
 	}
@@ -1319,11 +1319,8 @@ func TestOpenAIChatInboundAnthropicUpstreamStreamBridge(t *testing.T) {
 	if err := json.Unmarshal(startEvents[0].Data, &start); err != nil {
 		t.Fatalf("json.Unmarshal(start) error = %v", err)
 	}
-	if start.Usage == nil || start.Usage.PromptTokens == nil || *start.Usage.PromptTokens != 17 {
-		t.Fatalf("start usage = %+v", start.Usage)
-	}
-	if start.Usage.PromptTokensDetails == nil || start.Usage.PromptTokensDetails.CachedTokens == nil || *start.Usage.PromptTokensDetails.CachedTokens != 4 {
-		t.Fatalf("start cached tokens = %+v", start.Usage)
+	if start.Usage != nil {
+		t.Fatalf("start usage = %+v, want nil", start.Usage)
 	}
 
 	parts, err = decoder.Decode(RawStreamEvent{Event: "content_block_delta", Data: []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"think"}}`)})
@@ -1376,7 +1373,7 @@ func TestOpenAIChatInboundAnthropicUpstreamStreamBridge(t *testing.T) {
 		t.Fatalf("toolDelta = %+v", toolDelta)
 	}
 
-	parts, err = decoder.Decode(RawStreamEvent{Event: "message_delta", Data: []byte(`{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":4,"output_tokens":5}}`)})
+	parts, err = decoder.Decode(RawStreamEvent{Event: "message_delta", Data: []byte(`{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}`)})
 	if err != nil {
 		t.Fatalf("Decode(message_delta) error = %v", err)
 	}
@@ -1391,10 +1388,24 @@ func TestOpenAIChatInboundAnthropicUpstreamStreamBridge(t *testing.T) {
 	if len(finish.Choices) != 1 || finish.Choices[0].FinishReason == nil || *finish.Choices[0].FinishReason != "tool_calls" {
 		t.Fatalf("finish = %+v", finish)
 	}
-	if finish.Usage == nil || finish.Usage.PromptTokens == nil || *finish.Usage.PromptTokens != 17 || finish.Usage.CompletionTokens == nil || *finish.Usage.CompletionTokens != 5 {
-		t.Fatalf("finish usage = %+v", finish.Usage)
+	if finish.Usage != nil {
+		t.Fatalf("finish usage = %+v, want nil", finish.Usage)
 	}
-	if finish.Usage.PromptTokensDetails == nil || finish.Usage.PromptTokensDetails.CachedTokens == nil || *finish.Usage.PromptTokensDetails.CachedTokens != 4 {
-		t.Fatalf("finish cached tokens = %+v", finish.Usage)
+	closeEvents, err := encoder.Close()
+	if err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if len(closeEvents) != 2 || string(closeEvents[1].Data) != "[DONE]" {
+		t.Fatalf("Close events = %+v", closeEvents)
+	}
+	var summary openAIChatStreamChunk
+	if err := json.Unmarshal(closeEvents[0].Data, &summary); err != nil {
+		t.Fatalf("json.Unmarshal(summary) error = %v", err)
+	}
+	if len(summary.Choices) != 0 || summary.Usage == nil || summary.Usage.PromptTokens == nil || *summary.Usage.PromptTokens != 17 || summary.Usage.CompletionTokens == nil || *summary.Usage.CompletionTokens != 5 {
+		t.Fatalf("summary usage = %+v", summary)
+	}
+	if summary.Usage.PromptTokensDetails == nil || summary.Usage.PromptTokensDetails.CachedTokens == nil || *summary.Usage.PromptTokensDetails.CachedTokens != 4 {
+		t.Fatalf("summary cached tokens = %+v", summary.Usage)
 	}
 }

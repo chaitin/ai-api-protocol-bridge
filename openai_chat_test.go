@@ -523,7 +523,11 @@ func TestOpenAIChatStreamEncoder(t *testing.T) {
 		t.Fatalf("NewStreamEncoder() error = %v", err)
 	}
 
-	events, err := encoder.Encode(StreamPart{Type: StreamStart, ID: "chatcmpl-1"})
+	inputTokens := 13
+	outputTokens := 5
+	cachedTokens := 3
+	zeroOutputTokens := 0
+	events, err := encoder.Encode(StreamPart{Type: StreamStart, ID: "chatcmpl-1", Usage: Usage{InputTokens: &inputTokens, OutputTokens: &zeroOutputTokens, CachedInputTokens: &cachedTokens}})
 	if err != nil {
 		t.Fatalf("Encode(StreamStart) error = %v", err)
 	}
@@ -549,16 +553,11 @@ func TestOpenAIChatStreamEncoder(t *testing.T) {
 		t.Fatalf("delta content = %+v", chunk.Choices[0].Delta)
 	}
 
-	inputTokens := 13
-	outputTokens := 5
-	cachedTokens := 3
 	events, err = encoder.Encode(StreamPart{
 		Type:         StreamFinish,
 		FinishReason: FinishStop,
 		Usage: Usage{
-			InputTokens:       &inputTokens,
-			OutputTokens:      &outputTokens,
-			CachedInputTokens: &cachedTokens,
+			OutputTokens: &outputTokens,
 		},
 	})
 	if err != nil {
@@ -573,19 +572,25 @@ func TestOpenAIChatStreamEncoder(t *testing.T) {
 	if chunk.Choices[0].FinishReason == nil || *chunk.Choices[0].FinishReason != "stop" {
 		t.Fatalf("finish reason = %+v", chunk.Choices[0].FinishReason)
 	}
-	if chunk.Usage == nil || chunk.Usage.PromptTokens == nil || *chunk.Usage.PromptTokens != 13 || chunk.Usage.CompletionTokens == nil || *chunk.Usage.CompletionTokens != 5 {
-		t.Fatalf("finish usage = %+v", chunk.Usage)
-	}
-	if chunk.Usage.PromptTokensDetails == nil || chunk.Usage.PromptTokensDetails.CachedTokens == nil || *chunk.Usage.PromptTokensDetails.CachedTokens != 3 {
-		t.Fatalf("finish cached tokens = %+v", chunk.Usage)
+	if chunk.Usage != nil {
+		t.Fatalf("finish usage = %+v, want nil", chunk.Usage)
 	}
 
 	events, err = encoder.Close()
 	if err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	if len(events) != 1 || string(events[0].Data) != "[DONE]" {
+	if len(events) != 2 || string(events[1].Data) != "[DONE]" {
 		t.Fatalf("Close events = %+v", events)
+	}
+	if err := json.Unmarshal(events[0].Data, &chunk); err != nil {
+		t.Fatalf("Unmarshal(usage summary) error = %v", err)
+	}
+	if len(chunk.Choices) != 0 || chunk.Usage == nil || chunk.Usage.PromptTokens == nil || *chunk.Usage.PromptTokens != 13 || chunk.Usage.CompletionTokens == nil || *chunk.Usage.CompletionTokens != 5 {
+		t.Fatalf("usage summary = %+v", chunk)
+	}
+	if chunk.Usage.PromptTokensDetails == nil || chunk.Usage.PromptTokensDetails.CachedTokens == nil || *chunk.Usage.PromptTokensDetails.CachedTokens != 3 {
+		t.Fatalf("summary cached tokens = %+v", chunk.Usage)
 	}
 }
 

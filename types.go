@@ -289,6 +289,34 @@ type Usage struct {
 	CacheReadInputTokens     *int `json:"cache_read_input_tokens,omitempty"`
 }
 
+func mergeUsage(base *Usage, update Usage) {
+	if base == nil {
+		return
+	}
+	if update.InputTokens != nil {
+		base.InputTokens = update.InputTokens
+	}
+	if update.OutputTokens != nil {
+		base.OutputTokens = update.OutputTokens
+	}
+	if update.ReasoningTokens != nil {
+		base.ReasoningTokens = update.ReasoningTokens
+	}
+	if update.CachedInputTokens != nil {
+		base.CachedInputTokens = update.CachedInputTokens
+	}
+	if update.CacheCreationInputTokens != nil {
+		base.CacheCreationInputTokens = update.CacheCreationInputTokens
+	}
+	if update.CacheReadInputTokens != nil {
+		base.CacheReadInputTokens = update.CacheReadInputTokens
+	}
+}
+
+func hasUsage(usage Usage) bool {
+	return usage.InputTokens != nil || usage.OutputTokens != nil || usage.ReasoningTokens != nil || usage.CachedInputTokens != nil || usage.CacheCreationInputTokens != nil || usage.CacheReadInputTokens != nil
+}
+
 func calculateTotalTokens(inputTokens, outputTokens *int) *int {
 	if inputTokens == nil || outputTokens == nil {
 		return nil

@@ -316,8 +316,10 @@ func (d *openAIChatStreamDecoder) Close() ([]StreamPart, error) {
 
 type openAIChatStreamEncoder struct {
 	model       string
+	responseID  string
 	started     bool
 	finished    bool
+	usage       Usage
 	nextIndex   int
 	toolIndexes map[string]int
 	toolNames   map[string]string
@@ -333,19 +335,11 @@ func (e *openAIChatStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent, err
 	switch part.Type {
 	case StreamStart:
 		e.started = true
-		chunk := openAIChatStreamChunk{ID: part.ID, Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp()}
-		if part.Usage.InputTokens != nil || part.Usage.OutputTokens != nil {
-			chunk.Usage = &openAIChatStreamChunkUsage{
-				PromptTokens: part.Usage.InputTokens, CompletionTokens: part.Usage.OutputTokens,
-				TotalTokens: calculateTotalTokens(part.Usage.InputTokens, part.Usage.OutputTokens),
-			}
-			if part.Usage.CachedInputTokens != nil {
-				chunk.Usage.PromptTokensDetails = &openAIPromptTokensDetails{CachedTokens: part.Usage.CachedInputTokens}
-			}
-			if part.Usage.ReasoningTokens != nil {
-				chunk.Usage.CompletionTokensDetails = &openAICompletionTokensDetails{ReasoningTokens: part.Usage.ReasoningTokens}
-			}
+		if part.ID != "" {
+			e.responseID = part.ID
 		}
+		mergeUsage(&e.usage, part.Usage)
+		chunk := openAIChatStreamChunk{ID: part.ID, Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp()}
 		role := "assistant"
 		chunk.Choices = []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{Role: role}}}
 		return singleOpenAIChatStreamEvent(chunk)
@@ -376,23 +370,11 @@ func (e *openAIChatStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent, err
 		return e.encodeToolCall(part)
 	case StreamFinish:
 		e.finished = true
+		mergeUsage(&e.usage, part.Usage)
 		return e.encodeFinish(part)
 	case StreamResponseMetadata:
-		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{}}}}
-		if part.Usage.InputTokens != nil || part.Usage.OutputTokens != nil {
-			chunk.Usage = &openAIChatStreamChunkUsage{
-				PromptTokens:     part.Usage.InputTokens,
-				CompletionTokens: part.Usage.OutputTokens,
-				TotalTokens:      calculateTotalTokens(part.Usage.InputTokens, part.Usage.OutputTokens),
-			}
-			if part.Usage.CachedInputTokens != nil {
-				chunk.Usage.PromptTokensDetails = &openAIPromptTokensDetails{CachedTokens: part.Usage.CachedInputTokens}
-			}
-			if part.Usage.ReasoningTokens != nil {
-				chunk.Usage.CompletionTokensDetails = &openAICompletionTokensDetails{ReasoningTokens: part.Usage.ReasoningTokens}
-			}
-		}
-		return singleOpenAIChatStreamEvent(chunk)
+		mergeUsage(&e.usage, part.Usage)
+		return nil, nil
 	case StreamError:
 		return e.encodeStreamError(part)
 	case StreamRaw:
@@ -404,13 +386,19 @@ func (e *openAIChatStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent, err
 }
 
 func (e *openAIChatStreamEncoder) Close() ([]RawStreamEvent, error) {
-	if e.finished {
-		return []RawStreamEvent{{Data: []byte("[DONE]")}}, nil
+	events := make([]RawStreamEvent, 0, 3)
+	if !e.finished {
+		finishEvents, err := e.encodeFinish(StreamPart{Type: StreamFinish, FinishReason: FinishStop})
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, finishEvents...)
 	}
-	events, err := e.encodeFinish(StreamPart{Type: StreamFinish, FinishReason: FinishStop})
+	usageEvents, err := e.encodeUsageSummary()
 	if err != nil {
 		return nil, err
 	}
+	events = append(events, usageEvents...)
 	return append(events, RawStreamEvent{Data: []byte("[DONE]")}), nil
 }
 
@@ -458,18 +446,27 @@ func (e *openAIChatStreamEncoder) encodeToolCall(part StreamPart) ([]RawStreamEv
 func (e *openAIChatStreamEncoder) encodeFinish(part StreamPart) ([]RawStreamEvent, error) {
 	reason := encodeOpenAIFinishReason(part.FinishReason)
 	chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{}, FinishReason: &reason}}}
-	if part.Usage.InputTokens != nil || part.Usage.OutputTokens != nil {
-		chunk.Usage = &openAIChatStreamChunkUsage{
-			PromptTokens:     part.Usage.InputTokens,
-			CompletionTokens: part.Usage.OutputTokens,
-			TotalTokens:      calculateTotalTokens(part.Usage.InputTokens, part.Usage.OutputTokens),
-		}
-		if part.Usage.CachedInputTokens != nil {
-			chunk.Usage.PromptTokensDetails = &openAIPromptTokensDetails{CachedTokens: part.Usage.CachedInputTokens}
-		}
-		if part.Usage.ReasoningTokens != nil {
-			chunk.Usage.CompletionTokensDetails = &openAICompletionTokensDetails{ReasoningTokens: part.Usage.ReasoningTokens}
-		}
+	return singleOpenAIChatStreamEvent(chunk)
+}
+
+func (e *openAIChatStreamEncoder) encodeUsageSummary() ([]RawStreamEvent, error) {
+	if !hasUsage(e.usage) {
+		return nil, nil
+	}
+	usage := encodeOpenAIUsage(e.usage, billingUsageForProtocol(ProtocolOpenAIChat, e.usage))
+	chunk := openAIChatStreamChunk{
+		ID:      e.responseID,
+		Object:  "chat.completion.chunk",
+		Model:   e.model,
+		Created: currentTimestamp(),
+		Choices: []openAIChatStreamChoice{},
+		Usage: &openAIChatStreamChunkUsage{
+			PromptTokens:            usage.PromptTokens,
+			CompletionTokens:        usage.CompletionTokens,
+			TotalTokens:             usage.TotalTokens,
+			PromptTokensDetails:     usage.PromptTokensDetails,
+			CompletionTokensDetails: usage.CompletionTokensDetails,
+		},
 	}
 	return singleOpenAIChatStreamEvent(chunk)
 }

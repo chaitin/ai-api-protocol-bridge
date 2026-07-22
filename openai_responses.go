@@ -1057,15 +1057,6 @@ func mergeOpenAIResponsesUsage(base *Usage, extra Usage) {
 	base.OutputTokens = addUsageTokens(base.OutputTokens, extra.OutputTokens)
 }
 
-func mergeOpenAIResponsesStreamImageUsage(base *Usage, items []openAIResponsesStreamItem) {
-	for _, item := range items {
-		if item.Type != "image_generation_call" {
-			continue
-		}
-		mergeOpenAIResponsesUsage(base, decodeOpenAIResponsesImageUsage(item.Usage))
-	}
-}
-
 func responseStreamOutputItems(raw openAIResponsesStreamEvent) []openAIResponsesStreamItem {
 	if raw.Response != nil && len(raw.Response.Output) > 0 {
 		return raw.Response.Output
@@ -1445,12 +1436,19 @@ type openAIResponsesStreamDecoder struct {
 	endedTools        map[string]bool
 	hasToolCall       bool
 	hasRefusal        bool
+	imageUsage        []openAIResponsesStreamImageUsage
 }
 
 type openAIResponsesStreamToolState struct {
 	CallID string
 	Name   string
 	Custom bool
+}
+
+type openAIResponsesStreamImageUsage struct {
+	ID          string
+	OutputIndex *int
+	Usage       Usage
 }
 
 func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, error) {
@@ -1589,6 +1587,9 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 			d.hasToolCall = true
 			d.markToolEnded(raw.Item.ID)
 			return []StreamPart{{Type: StreamToolInputEnd, ID: raw.Item.ID, ToolCallID: raw.Item.CallID, ToolName: raw.Item.Name, ProviderMetadata: map[string]any{"custom_tool_call": true}}}, nil
+		case "image_generation_call":
+			d.rememberImageGenerationUsage(*raw.Item, raw.OutputIndex)
+			return nil, nil
 		default:
 			return nil, nil
 		}
@@ -1607,7 +1608,7 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 				finish.Usage = decodeOpenAIResponsesUsage(*raw.Response.Usage)
 			}
 		}
-		mergeOpenAIResponsesStreamImageUsage(&finish.Usage, responseStreamOutputItems(raw))
+		d.mergeImageGenerationUsage(&finish.Usage, responseStreamOutputItems(raw))
 		parts = append(parts, finish)
 		return parts, nil
 	case "response.incomplete":
@@ -1623,7 +1624,7 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 				finish.Usage = decodeOpenAIResponsesUsage(*raw.Response.Usage)
 			}
 		}
-		mergeOpenAIResponsesStreamImageUsage(&finish.Usage, responseStreamOutputItems(raw))
+		d.mergeImageGenerationUsage(&finish.Usage, responseStreamOutputItems(raw))
 		parts = append(parts, finish)
 		return parts, nil
 	case "response.failed":
@@ -1633,6 +1634,58 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 	default:
 		return []StreamPart{{Type: StreamRaw, RawValue: raw}}, nil
 	}
+}
+
+func (d *openAIResponsesStreamDecoder) rememberImageGenerationUsage(item openAIResponsesStreamItem, outputIndex *int) {
+	usage := decodeOpenAIResponsesImageUsage(item.Usage)
+	for index := range d.imageUsage {
+		remembered := d.imageUsage[index]
+		if sameOpenAIResponsesStreamImageItem(remembered.ID, remembered.OutputIndex, item.ID, outputIndex) {
+			d.imageUsage[index].Usage = fillMissingUsageTokens(usage, remembered.Usage)
+			return
+		}
+	}
+	d.imageUsage = append(d.imageUsage, openAIResponsesStreamImageUsage{ID: item.ID, OutputIndex: outputIndex, Usage: usage})
+}
+
+func (d *openAIResponsesStreamDecoder) mergeImageGenerationUsage(base *Usage, items []openAIResponsesStreamItem) {
+	mergedRemembered := make([]bool, len(d.imageUsage))
+	for outputIndex, item := range items {
+		if item.Type != "image_generation_call" {
+			continue
+		}
+		usage := decodeOpenAIResponsesImageUsage(item.Usage)
+		for index, remembered := range d.imageUsage {
+			if sameOpenAIResponsesStreamImageItem(remembered.ID, remembered.OutputIndex, item.ID, &outputIndex) {
+				usage = fillMissingUsageTokens(usage, remembered.Usage)
+				mergedRemembered[index] = true
+				break
+			}
+		}
+		mergeOpenAIResponsesUsage(base, usage)
+	}
+	for index, remembered := range d.imageUsage {
+		if !mergedRemembered[index] {
+			mergeOpenAIResponsesUsage(base, remembered.Usage)
+		}
+	}
+}
+
+func sameOpenAIResponsesStreamImageItem(leftID string, leftIndex *int, rightID string, rightIndex *int) bool {
+	if leftID != "" && rightID != "" {
+		return leftID == rightID
+	}
+	return leftIndex != nil && rightIndex != nil && *leftIndex == *rightIndex
+}
+
+func fillMissingUsageTokens(usage Usage, fallback Usage) Usage {
+	if usage.InputTokens == nil {
+		usage.InputTokens = fallback.InputTokens
+	}
+	if usage.OutputTokens == nil {
+		usage.OutputTokens = fallback.OutputTokens
+	}
+	return usage
 }
 
 func openAIResponsesContentHasRefusal(parts []openAIResponsesContentPart) bool {
