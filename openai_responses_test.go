@@ -2,6 +2,7 @@ package protocolbridge
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -1373,6 +1374,181 @@ func TestOpenAIResponsesStreamEncoderFinishDetails(t *testing.T) {
 			}
 			if tc.wantErrVal && event.Response.Error == nil {
 				t.Fatalf("error missing from response = %+v", event.Response)
+			}
+		})
+	}
+}
+
+func TestOpenAIResponsesStreamEncoderCompletedOutputMatchesDoneItems(t *testing.T) {
+	for _, withText := range []bool{false, true} {
+		name := "without text"
+		if withText {
+			name = "with text"
+		}
+		t.Run(name, func(t *testing.T) {
+			encoder, err := NewOpenAIResponsesAdapter().NewStreamEncoder(StreamEncodeOptions{Model: "glm-5.3-flash"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var events []RawStreamEvent
+			encode := func(part StreamPart) {
+				t.Helper()
+				encoded, err := encoder.Encode(part)
+				if err != nil {
+					t.Fatalf("Encode(%s) error = %v", part.Type, err)
+				}
+				events = append(events, encoded...)
+			}
+			encode(StreamPart{Type: StreamStart, ID: "resp_1"})
+			encode(StreamPart{Type: StreamReasoningStart})
+			encode(StreamPart{Type: StreamReasoningDelta, Delta: "checking indexes"})
+			encode(StreamPart{Type: StreamReasoningEnd})
+			if withText {
+				encode(StreamPart{Type: StreamTextStart})
+				encode(StreamPart{Type: StreamTextDelta, Delta: "I'll inspect both."})
+				encode(StreamPart{Type: StreamTextEnd})
+			}
+			for _, tool := range []struct{ name, callID, arguments string }{
+				{"read_notes", "call_1", "{}"},
+				{"read_recon", "call_2", `{"page":1}`},
+			} {
+				encode(StreamPart{Type: StreamToolInputStart, ToolName: tool.name, ToolCallID: tool.callID})
+				encode(StreamPart{Type: StreamToolInputDelta, Delta: tool.arguments[:1]})
+				encode(StreamPart{Type: StreamToolInputDelta, Delta: tool.arguments[1:]})
+				encode(StreamPart{Type: StreamToolInputEnd})
+			}
+			encode(StreamPart{Type: StreamFinish, FinishReason: FinishToolCalls})
+			if events[len(events)-1].Event != "response.completed" {
+				t.Fatalf("last event = %s; want response.completed", events[len(events)-1].Event)
+			}
+
+			var added, done []map[string]any
+			argumentDones := 0
+			for i, event := range events {
+				payload := rawStreamEventMap(t, event)
+				if payload["sequence_number"] != float64(i) {
+					t.Fatalf("event %d (%s) sequence_number = %v", i, event.Event, payload["sequence_number"])
+				}
+				switch event.Event {
+				case "response.output_item.added":
+					if payload["output_index"] != float64(len(added)) {
+						t.Fatalf("added output_index = %v; want %d", payload["output_index"], len(added))
+					}
+					item := payload["item"].(map[string]any)
+					if item["type"] == "function_call" && item["arguments"] != "" {
+						t.Fatalf("function_call added arguments = %v; want empty string", item["arguments"])
+					}
+					added = append(added, item)
+				case "response.function_call_arguments.done":
+					argumentDones++
+					index := int(payload["output_index"].(float64))
+					if index != len(done) || payload["item_id"] != added[index]["id"] {
+						t.Fatalf("arguments done index/id = %+v", payload)
+					}
+					if want := map[string]string{"call_1": "{}", "call_2": `{"page":1}`}[added[index]["call_id"].(string)]; payload["arguments"] != want {
+						t.Fatalf("arguments done = %v; want %q", payload["arguments"], want)
+					}
+					if i+1 >= len(events) || events[i+1].Event != "response.output_item.done" {
+						t.Fatalf("arguments done not followed by item done at event %d", i)
+					}
+				case "response.output_item.done":
+					if payload["output_index"] != float64(len(done)) {
+						t.Fatalf("done output_index = %v; want %d", payload["output_index"], len(done))
+					}
+					item := payload["item"].(map[string]any)
+					if item["id"] != added[len(done)]["id"] || item["status"] != "completed" {
+						t.Fatalf("done item = %+v, added = %+v", item, added[len(done)])
+					}
+					if item["type"] == "function_call" && (item["name"] != added[len(done)]["name"] || item["call_id"] != added[len(done)]["call_id"] || item["arguments"] == nil) {
+						t.Fatalf("incomplete function_call done item = %+v", item)
+					}
+					done = append(done, item)
+				case "response.completed":
+					if _, exists := payload["output"]; exists {
+						t.Fatalf("output at event top level: %+v", payload)
+					}
+					response := payload["response"].(map[string]any)
+					if !reflect.DeepEqual(response["output"], mapsToAny(done)) {
+						t.Fatalf("response.output = %+v; done items = %+v", response["output"], done)
+					}
+				}
+			}
+			if len(added) != len(done) || argumentDones != 2 {
+				t.Fatalf("added = %d, done = %d, arguments done = %d", len(added), len(done), argumentDones)
+			}
+		})
+	}
+}
+
+func mapsToAny(items []map[string]any) []any {
+	result := make([]any, len(items))
+	for i, item := range items {
+		result[i] = item
+	}
+	return result
+}
+
+func TestOpenAIResponsesStreamEncoderOtherToolCallsAndEmptyOutput(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		parts    []StreamPart
+		wantType string
+		wantArgs string
+	}{
+		{"standalone", []StreamPart{{Type: StreamToolCall, ToolName: "read_notes", ToolCallID: "call_1", Input: map[string]any{}}}, "function_call", "{}"},
+		{"empty function arguments", []StreamPart{{Type: StreamToolInputStart, ToolName: "read_notes", ToolCallID: "call_1"}, {Type: StreamToolInputEnd}}, "function_call", ""},
+		{"custom", []StreamPart{{Type: StreamToolInputStart, ToolName: "custom", ToolCallID: "call_2", ProviderMetadata: map[string]any{"custom_tool_call": true}}, {Type: StreamToolInputDelta, Delta: "raw", ProviderMetadata: map[string]any{"custom_tool_call": true}}, {Type: StreamToolInputEnd, ProviderMetadata: map[string]any{"custom_tool_call": true}}}, "custom_tool_call", "raw"},
+		{"empty", nil, "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			encoder, err := NewOpenAIResponsesAdapter().NewStreamEncoder(StreamEncodeOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var events []RawStreamEvent
+			for _, part := range append(append([]StreamPart{{Type: StreamStart, ID: "resp_1"}}, tc.parts...), StreamPart{Type: StreamFinish}) {
+				encoded, err := encoder.Encode(part)
+				if err != nil {
+					t.Fatal(err)
+				}
+				events = append(events, encoded...)
+			}
+			var doneItem map[string]any
+			for i, event := range events {
+				payload := rawStreamEventMap(t, event)
+				if payload["sequence_number"] != float64(i) {
+					t.Fatalf("event %d (%s) sequence_number = %v", i, event.Event, payload["sequence_number"])
+				}
+				if event.Event == "response.function_call_arguments.done" && payload["arguments"] != tc.wantArgs {
+					t.Fatalf("arguments done = %+v", payload)
+				}
+				if event.Event == "response.custom_tool_call_input.done" && payload["input"] != tc.wantArgs {
+					t.Fatalf("custom input done = %+v", payload)
+				}
+				if event.Event == "response.output_item.added" && tc.wantType == "function_call" && payload["item"].(map[string]any)["arguments"] != "" {
+					t.Fatalf("function_call added = %+v", payload["item"])
+				}
+				if event.Event == "response.output_item.done" {
+					doneItem = payload["item"].(map[string]any)
+				}
+			}
+			last := rawStreamEventMap(t, events[len(events)-1])
+			if events[len(events)-1].Event != "response.completed" {
+				t.Fatalf("last event = %s; want response.completed", events[len(events)-1].Event)
+			}
+			response := last["response"].(map[string]any)
+			output := response["output"].([]any)
+			if tc.wantType == "" {
+				if len(output) != 0 {
+					t.Fatalf("empty output = %+v", output)
+				}
+				return
+			}
+			if len(output) != 1 || !reflect.DeepEqual(output[0], doneItem) || doneItem["type"] != tc.wantType {
+				t.Fatalf("output = %+v, done item = %+v", output, doneItem)
+			}
+			if tc.wantType == "custom_tool_call" && doneItem["input"] != "raw" {
+				t.Fatalf("custom done = %+v", doneItem)
 			}
 		})
 	}

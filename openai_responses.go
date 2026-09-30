@@ -1378,19 +1378,21 @@ type openAIResponsesOutputTokensDetails struct {
 }
 
 type openAIResponsesStreamEvent struct {
-	Type         string                            `json:"type"`
-	Response     *openAIResponsesStreamResponse    `json:"response,omitempty"`
-	Item         *openAIResponsesStreamItem        `json:"item,omitempty"`
-	ItemID       string                            `json:"item_id,omitempty"`
-	ContentPart  *openAIResponsesStreamContentPart `json:"content_part,omitempty"`
-	Index        int                               `json:"index,omitempty"`
-	OutputIndex  *int                              `json:"output_index,omitempty"`
-	ContentIndex *int                              `json:"content_index,omitempty"`
-	Delta        string                            `json:"delta,omitempty"`
-	Arguments    string                            `json:"arguments,omitempty"`
-	Usage        *openAIResponsesUsage             `json:"usage,omitempty"`
-	Error        any                               `json:"error,omitempty"`
-	Output       []openAIResponsesStreamItem       `json:"output,omitempty"`
+	Type           string                            `json:"type"`
+	SequenceNumber int                               `json:"sequence_number"`
+	Response       *openAIResponsesStreamResponse    `json:"response,omitempty"`
+	Item           *openAIResponsesStreamItem        `json:"item,omitempty"`
+	ItemID         string                            `json:"item_id,omitempty"`
+	ContentPart    *openAIResponsesStreamContentPart `json:"content_part,omitempty"`
+	Index          int                               `json:"index,omitempty"`
+	OutputIndex    *int                              `json:"output_index,omitempty"`
+	ContentIndex   *int                              `json:"content_index,omitempty"`
+	Delta          string                            `json:"delta,omitempty"`
+	Arguments      *string                           `json:"arguments,omitempty"`
+	Input          *string                           `json:"input,omitempty"`
+	Usage          *openAIResponsesUsage             `json:"usage,omitempty"`
+	Error          any                               `json:"error,omitempty"`
+	Output         []openAIResponsesStreamItem       `json:"output,omitempty"`
 }
 
 type openAIResponsesStreamResponse struct {
@@ -1401,7 +1403,7 @@ type openAIResponsesStreamResponse struct {
 	IncompleteDetails *openAIResponsesIncompleteDetails `json:"incomplete_details,omitempty"`
 	Model             string                            `json:"model,omitempty"`
 	Usage             *openAIResponsesUsage             `json:"usage,omitempty"`
-	Output            []openAIResponsesStreamItem       `json:"output,omitempty"`
+	Output            []openAIResponsesStreamItem       `json:"output"`
 }
 
 type openAIResponsesStreamItem struct {
@@ -1537,8 +1539,8 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 		return parts, nil
 	case "response.function_call_arguments.delta":
 		delta := raw.Delta
-		if delta == "" {
-			delta = raw.Arguments
+		if delta == "" && raw.Arguments != nil {
+			delta = *raw.Arguments
 		}
 		state := d.activeTool(raw.ItemID)
 		return []StreamPart{{Type: StreamToolInputDelta, ID: raw.ItemID, ToolCallID: state.CallID, ToolName: state.Name, Delta: delta}}, nil
@@ -1837,21 +1839,22 @@ func (d *openAIResponsesStreamDecoder) Close() ([]StreamPart, error) {
 }
 
 type openAIResponsesStreamEncoder struct {
-	model        string
-	started      bool
-	finished     bool
-	responseID   string
-	itemCounter  int
-	currentMsgID string
-	msgText      string
-	currentRsID  string
-	rsSummary    string
-	rsEncrypted  string
-	currentFcID  string
-	fcName       string
-	fcCallID     string
-	fcArguments  string
-	outputItems  []openAIResponsesStreamItem
+	model          string
+	started        bool
+	finished       bool
+	responseID     string
+	itemCounter    int
+	sequenceNumber int
+	currentMsgID   string
+	msgText        string
+	currentRsID    string
+	rsSummary      string
+	rsEncrypted    string
+	currentFcID    string
+	fcName         string
+	fcCallID       string
+	fcArguments    string
+	outputItems    []openAIResponsesStreamItem
 }
 
 func (e *openAIResponsesStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent, error) {
@@ -1859,16 +1862,16 @@ func (e *openAIResponsesStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent
 	case StreamStart:
 		e.started = true
 		e.responseID = part.ID
-		resp := openAIResponsesStreamResponse{ID: part.ID, Object: "response", Status: "in_progress", Model: e.model}
+		resp := openAIResponsesStreamResponse{ID: part.ID, Object: "response", Status: "in_progress", Model: e.model, Output: []openAIResponsesStreamItem{}}
 		if part.Usage.InputTokens != nil || part.Usage.OutputTokens != nil {
 			u := encodeOpenAIResponsesUsage(part.Usage, billingUsageForProtocol(ProtocolOpenAIResponses, part.Usage))
 			resp.Usage = &u
 		}
-		created, err := singleOpenAIResponsesStreamEvent("response.created", openAIResponsesStreamEvent{Type: "response.created", Response: &resp})
+		created, err := e.singleOpenAIResponsesStreamEvent("response.created", openAIResponsesStreamEvent{Type: "response.created", Response: &resp})
 		if err != nil {
 			return nil, err
 		}
-		inProgress, err := singleOpenAIResponsesStreamEvent("response.in_progress", openAIResponsesStreamEvent{Type: "response.in_progress", Response: &resp})
+		inProgress, err := e.singleOpenAIResponsesStreamEvent("response.in_progress", openAIResponsesStreamEvent{Type: "response.in_progress", Response: &resp})
 		if err != nil {
 			return nil, err
 		}
@@ -1879,11 +1882,11 @@ func (e *openAIResponsesStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent
 		e.msgText = ""
 		msgItem := openAIResponsesStreamItem{ID: itemID, Type: "message", Role: string(RoleAssistant), Status: "in_progress", Content: []openAIResponsesContentPart{{Type: "output_text", Text: ""}}}
 		outputIndex := len(e.outputItems)
-		added, err := singleOpenAIResponsesStreamEvent("response.output_item.added", openAIResponsesStreamEvent{Type: "response.output_item.added", OutputIndex: intPtr(outputIndex), Item: &msgItem})
+		added, err := e.singleOpenAIResponsesStreamEvent("response.output_item.added", openAIResponsesStreamEvent{Type: "response.output_item.added", OutputIndex: intPtr(outputIndex), Item: &msgItem})
 		if err != nil {
 			return nil, err
 		}
-		partAdded, err := singleOpenAIResponsesStreamEvent("response.content_part.added", openAIResponsesStreamEvent{Type: "response.content_part.added", ItemID: itemID, OutputIndex: intPtr(outputIndex), ContentIndex: intPtr(0), ContentPart: &openAIResponsesStreamContentPart{Type: "output_text", Text: ""}})
+		partAdded, err := e.singleOpenAIResponsesStreamEvent("response.content_part.added", openAIResponsesStreamEvent{Type: "response.content_part.added", ItemID: itemID, OutputIndex: intPtr(outputIndex), ContentIndex: intPtr(0), ContentPart: &openAIResponsesStreamContentPart{Type: "output_text", Text: ""}})
 		if err != nil {
 			return nil, err
 		}
@@ -1898,22 +1901,22 @@ func (e *openAIResponsesStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent
 			events = append(events, startEvents...)
 		}
 		e.msgText += part.Delta
-		deltaEvents, err := singleOpenAIResponsesStreamEvent("response.output_text.delta", openAIResponsesStreamEvent{Type: "response.output_text.delta", ItemID: e.currentMsgID, OutputIndex: intPtr(len(e.outputItems)), ContentIndex: intPtr(0), Delta: part.Delta})
+		deltaEvents, err := e.singleOpenAIResponsesStreamEvent("response.output_text.delta", openAIResponsesStreamEvent{Type: "response.output_text.delta", ItemID: e.currentMsgID, OutputIndex: intPtr(len(e.outputItems)), ContentIndex: intPtr(0), Delta: part.Delta})
 		if err != nil {
 			return nil, err
 		}
 		return append(events, deltaEvents...), nil
 	case StreamTextEnd:
 		outputIndex := len(e.outputItems)
-		done, err := singleOpenAIResponsesStreamEvent("response.output_text.done", openAIResponsesStreamEvent{Type: "response.output_text.done", ItemID: e.currentMsgID, OutputIndex: intPtr(outputIndex), ContentIndex: intPtr(0)})
+		done, err := e.singleOpenAIResponsesStreamEvent("response.output_text.done", openAIResponsesStreamEvent{Type: "response.output_text.done", ItemID: e.currentMsgID, OutputIndex: intPtr(outputIndex), ContentIndex: intPtr(0)})
 		if err != nil {
 			return nil, err
 		}
-		partDone, err := singleOpenAIResponsesStreamEvent("response.content_part.done", openAIResponsesStreamEvent{Type: "response.content_part.done", ItemID: e.currentMsgID, OutputIndex: intPtr(outputIndex), ContentIndex: intPtr(0), ContentPart: &openAIResponsesStreamContentPart{Type: "output_text", Text: e.msgText, Annotations: []openAIResponsesAnnotation{}}})
+		partDone, err := e.singleOpenAIResponsesStreamEvent("response.content_part.done", openAIResponsesStreamEvent{Type: "response.content_part.done", ItemID: e.currentMsgID, OutputIndex: intPtr(outputIndex), ContentIndex: intPtr(0), ContentPart: &openAIResponsesStreamContentPart{Type: "output_text", Text: e.msgText, Annotations: []openAIResponsesAnnotation{}}})
 		if err != nil {
 			return nil, err
 		}
-		itemDone, err := singleOpenAIResponsesStreamEvent("response.output_item.done", openAIResponsesStreamEvent{Type: "response.output_item.done", OutputIndex: intPtr(outputIndex), Item: &openAIResponsesStreamItem{ID: e.currentMsgID, Type: "message", Role: string(RoleAssistant), Status: "completed", Content: []openAIResponsesContentPart{{Type: "output_text", Text: e.msgText, Annotations: []openAIResponsesAnnotation{}}}}})
+		itemDone, err := e.singleOpenAIResponsesStreamEvent("response.output_item.done", openAIResponsesStreamEvent{Type: "response.output_item.done", OutputIndex: intPtr(outputIndex), Item: &openAIResponsesStreamItem{ID: e.currentMsgID, Type: "message", Role: string(RoleAssistant), Status: "completed", Content: []openAIResponsesContentPart{{Type: "output_text", Text: e.msgText, Annotations: []openAIResponsesAnnotation{}}}}})
 		if err != nil {
 			return nil, err
 		}
@@ -1927,20 +1930,20 @@ func (e *openAIResponsesStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent
 		e.rsSummary = ""
 		e.rsEncrypted = ""
 		rsItem := openAIResponsesStreamItem{ID: itemID, Type: "reasoning", Status: "in_progress"}
-		return singleOpenAIResponsesStreamEvent("response.output_item.added", openAIResponsesStreamEvent{Type: "response.output_item.added", OutputIndex: intPtr(len(e.outputItems)), Item: &rsItem})
+		return e.singleOpenAIResponsesStreamEvent("response.output_item.added", openAIResponsesStreamEvent{Type: "response.output_item.added", OutputIndex: intPtr(len(e.outputItems)), Item: &rsItem})
 	case StreamReasoningDelta:
 		if signature, ok := part.ProviderMetadata["signature"].(string); ok && signature != "" {
 			e.rsEncrypted += signature
 			return nil, nil
 		}
 		e.rsSummary += part.Delta
-		return singleOpenAIResponsesStreamEvent("response.reasoning_summary_text.delta", openAIResponsesStreamEvent{Type: "response.reasoning_summary_text.delta", ItemID: e.currentRsID, OutputIndex: intPtr(len(e.outputItems)), Delta: part.Delta})
+		return e.singleOpenAIResponsesStreamEvent("response.reasoning_summary_text.delta", openAIResponsesStreamEvent{Type: "response.reasoning_summary_text.delta", ItemID: e.currentRsID, OutputIndex: intPtr(len(e.outputItems)), Delta: part.Delta})
 	case StreamReasoningEnd:
 		item := openAIResponsesStreamItem{ID: e.currentRsID, Type: "reasoning", Status: "completed", EncryptedContent: e.rsEncrypted}
 		if e.rsSummary != "" {
 			item.Summary = []openAIResponsesContentPart{{Type: "summary_text", Text: e.rsSummary}}
 		}
-		itemDone, err := singleOpenAIResponsesStreamEvent("response.output_item.done", openAIResponsesStreamEvent{Type: "response.output_item.done", OutputIndex: intPtr(len(e.outputItems)), Item: &item})
+		itemDone, err := e.singleOpenAIResponsesStreamEvent("response.output_item.done", openAIResponsesStreamEvent{Type: "response.output_item.done", OutputIndex: intPtr(len(e.outputItems)), Item: &item})
 		if err != nil {
 			return nil, err
 		}
@@ -1957,41 +1960,50 @@ func (e *openAIResponsesStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent
 		e.fcArguments = ""
 		if custom, ok := part.ProviderMetadata["custom_tool_call"].(bool); ok && custom {
 			fcItem := openAIResponsesStreamItem{ID: itemID, Type: "custom_tool_call", Status: "in_progress", Name: part.ToolName, CallID: part.ToolCallID, Input: ""}
-			return singleOpenAIResponsesStreamEvent("response.output_item.added", openAIResponsesStreamEvent{Type: "response.output_item.added", OutputIndex: intPtr(len(e.outputItems)), Item: &fcItem})
+			return e.singleOpenAIResponsesStreamEvent("response.output_item.added", openAIResponsesStreamEvent{Type: "response.output_item.added", OutputIndex: intPtr(len(e.outputItems)), Item: &fcItem})
 		}
-		fcItem := openAIResponsesStreamItem{ID: itemID, Type: "function_call", Status: "in_progress", Name: part.ToolName, CallID: part.ToolCallID}
-		return singleOpenAIResponsesStreamEvent("response.output_item.added", openAIResponsesStreamEvent{Type: "response.output_item.added", OutputIndex: intPtr(len(e.outputItems)), Item: &fcItem})
+		fcItem := openAIResponsesStreamItem{ID: itemID, Type: "function_call", Status: "in_progress", Name: part.ToolName, CallID: part.ToolCallID, Arguments: newOpenAIResponsesArgumentsString("")}
+		return e.singleOpenAIResponsesStreamEvent("response.output_item.added", openAIResponsesStreamEvent{Type: "response.output_item.added", OutputIndex: intPtr(len(e.outputItems)), Item: &fcItem})
 	case StreamToolInputDelta:
 		if e.currentFcID == "" {
 			e.currentFcID = e.nextItemID("fc")
 		}
 		e.fcArguments += part.Delta
 		if custom, ok := part.ProviderMetadata["custom_tool_call"].(bool); ok && custom {
-			return singleOpenAIResponsesStreamEvent("response.custom_tool_call_input.delta", openAIResponsesStreamEvent{Type: "response.custom_tool_call_input.delta", ItemID: e.currentFcID, OutputIndex: intPtr(len(e.outputItems)), Delta: part.Delta})
+			return e.singleOpenAIResponsesStreamEvent("response.custom_tool_call_input.delta", openAIResponsesStreamEvent{Type: "response.custom_tool_call_input.delta", ItemID: e.currentFcID, OutputIndex: intPtr(len(e.outputItems)), Delta: part.Delta})
 		}
-		return singleOpenAIResponsesStreamEvent("response.function_call_arguments.delta", openAIResponsesStreamEvent{Type: "response.function_call_arguments.delta", ItemID: e.currentFcID, OutputIndex: intPtr(len(e.outputItems)), Delta: part.Delta})
+		return e.singleOpenAIResponsesStreamEvent("response.function_call_arguments.delta", openAIResponsesStreamEvent{Type: "response.function_call_arguments.delta", ItemID: e.currentFcID, OutputIndex: intPtr(len(e.outputItems)), Delta: part.Delta})
 	case StreamToolInputEnd:
+		if e.currentFcID == "" {
+			return nil, nil
+		}
 		itemID := e.currentFcID
-		if e.currentFcID != "" {
-			custom, _ := part.ProviderMetadata["custom_tool_call"].(bool)
-			itemType := "function_call"
-			item := openAIResponsesStreamItem{ID: e.currentFcID, Type: itemType, Status: "completed", Name: e.fcName, CallID: e.fcCallID, Arguments: newOpenAIResponsesArgumentsString(e.fcArguments)}
-			if custom {
-				item.Type = "custom_tool_call"
-				item.Arguments = nil
-				item.Input = e.fcArguments
-			}
-			e.outputItems = append(e.outputItems, item)
-			e.currentFcID = ""
+		custom, _ := part.ProviderMetadata["custom_tool_call"].(bool)
+		item := openAIResponsesStreamItem{ID: itemID, Type: "function_call", Status: "completed", Name: e.fcName, CallID: e.fcCallID, Arguments: newOpenAIResponsesArgumentsString(e.fcArguments)}
+		if custom {
+			item.Type = "custom_tool_call"
+			item.Arguments = nil
+			item.Input = e.fcArguments
 		}
-		outputIndex := len(e.outputItems) - 1
-		if outputIndex < 0 {
-			outputIndex = 0
+		outputIndex := len(e.outputItems)
+		var done []RawStreamEvent
+		var err error
+		if custom {
+			done, err = e.singleOpenAIResponsesStreamEvent("response.custom_tool_call_input.done", openAIResponsesStreamEvent{Type: "response.custom_tool_call_input.done", ItemID: itemID, OutputIndex: intPtr(outputIndex), Input: &e.fcArguments})
+		} else {
+			done, err = e.singleOpenAIResponsesStreamEvent("response.function_call_arguments.done", openAIResponsesStreamEvent{Type: "response.function_call_arguments.done", ItemID: itemID, OutputIndex: intPtr(outputIndex), Arguments: &e.fcArguments})
 		}
-		if custom, ok := part.ProviderMetadata["custom_tool_call"].(bool); ok && custom {
-			return singleOpenAIResponsesStreamEvent("response.custom_tool_call_input.done", openAIResponsesStreamEvent{Type: "response.custom_tool_call_input.done", ItemID: itemID, OutputIndex: intPtr(outputIndex)})
+		if err != nil {
+			return nil, err
 		}
-		return singleOpenAIResponsesStreamEvent("response.function_call_arguments.done", openAIResponsesStreamEvent{Type: "response.function_call_arguments.done", ItemID: itemID, OutputIndex: intPtr(outputIndex)})
+		itemDone, err := e.singleOpenAIResponsesStreamEvent("response.output_item.done", openAIResponsesStreamEvent{Type: "response.output_item.done", OutputIndex: intPtr(outputIndex), Item: &item})
+		if err != nil {
+			return nil, err
+		}
+		e.outputItems = append(e.outputItems, item)
+		e.currentFcID = ""
+		e.fcArguments = ""
+		return append(done, itemDone...), nil
 	case StreamToolCall:
 		return e.encodeToolCall(part)
 	case StreamFinish:
@@ -2002,7 +2014,7 @@ func (e *openAIResponsesStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent
 	case StreamError:
 		return e.encodeStreamError(part)
 	case StreamRaw:
-		return singleOpenAIResponsesStreamEvent("raw", openAIResponsesStreamEvent{Type: "raw", Delta: fmt.Sprint(part.RawValue)})
+		return e.singleOpenAIResponsesStreamEvent("raw", openAIResponsesStreamEvent{Type: "raw", Delta: fmt.Sprint(part.RawValue)})
 	default:
 		return nil, nil
 	}
@@ -2038,22 +2050,22 @@ func (e *openAIResponsesStreamEncoder) encodeToolCall(part StreamPart) ([]RawStr
 	itemID := e.nextItemID("fc")
 	var events []RawStreamEvent
 	outputIndex := len(e.outputItems)
-	added, err := singleOpenAIResponsesStreamEvent("response.output_item.added", openAIResponsesStreamEvent{Type: "response.output_item.added", OutputIndex: intPtr(outputIndex), Item: &openAIResponsesStreamItem{ID: itemID, Type: "function_call", Status: "in_progress", Name: name, CallID: toolID}})
+	added, err := e.singleOpenAIResponsesStreamEvent("response.output_item.added", openAIResponsesStreamEvent{Type: "response.output_item.added", OutputIndex: intPtr(outputIndex), Item: &openAIResponsesStreamItem{ID: itemID, Type: "function_call", Status: "in_progress", Name: name, CallID: toolID, Arguments: newOpenAIResponsesArgumentsString("")}})
 	if err != nil {
 		return nil, err
 	}
 	events = append(events, added...)
-	delta, err := singleOpenAIResponsesStreamEvent("response.function_call_arguments.delta", openAIResponsesStreamEvent{Type: "response.function_call_arguments.delta", ItemID: itemID, OutputIndex: intPtr(outputIndex), Delta: input})
+	delta, err := e.singleOpenAIResponsesStreamEvent("response.function_call_arguments.delta", openAIResponsesStreamEvent{Type: "response.function_call_arguments.delta", ItemID: itemID, OutputIndex: intPtr(outputIndex), Delta: input})
 	if err != nil {
 		return nil, err
 	}
 	events = append(events, delta...)
-	done, err := singleOpenAIResponsesStreamEvent("response.function_call_arguments.done", openAIResponsesStreamEvent{Type: "response.function_call_arguments.done", ItemID: itemID, OutputIndex: intPtr(outputIndex)})
+	done, err := e.singleOpenAIResponsesStreamEvent("response.function_call_arguments.done", openAIResponsesStreamEvent{Type: "response.function_call_arguments.done", ItemID: itemID, OutputIndex: intPtr(outputIndex), Arguments: &input})
 	if err != nil {
 		return nil, err
 	}
 	events = append(events, done...)
-	itemDone, err := singleOpenAIResponsesStreamEvent("response.output_item.done", openAIResponsesStreamEvent{Type: "response.output_item.done", OutputIndex: intPtr(outputIndex), Item: &openAIResponsesStreamItem{ID: itemID, Type: "function_call", Status: "completed", Name: name, CallID: toolID, Arguments: newOpenAIResponsesArgumentsString(input)}})
+	itemDone, err := e.singleOpenAIResponsesStreamEvent("response.output_item.done", openAIResponsesStreamEvent{Type: "response.output_item.done", OutputIndex: intPtr(outputIndex), Item: &openAIResponsesStreamItem{ID: itemID, Type: "function_call", Status: "completed", Name: name, CallID: toolID, Arguments: newOpenAIResponsesArgumentsString(input)}})
 	if err != nil {
 		return nil, err
 	}
@@ -2085,11 +2097,12 @@ func (e *openAIResponsesStreamEncoder) encodeFinish(part StreamPart) ([]RawStrea
 	}
 	outputItems := make([]openAIResponsesStreamItem, len(e.outputItems))
 	copy(outputItems, e.outputItems)
-	return singleOpenAIResponsesStreamEvent(eventType, openAIResponsesStreamEvent{Type: eventType, Response: &resp, Output: outputItems})
+	resp.Output = outputItems
+	return e.singleOpenAIResponsesStreamEvent(eventType, openAIResponsesStreamEvent{Type: eventType, Response: &resp})
 }
 
 func (e *openAIResponsesStreamEncoder) encodeStreamError(part StreamPart) ([]RawStreamEvent, error) {
-	return singleOpenAIResponsesStreamEvent("error", openAIResponsesStreamEvent{Type: "error", Error: part.Error})
+	return e.singleOpenAIResponsesStreamEvent("error", openAIResponsesStreamEvent{Type: "error", Error: part.Error})
 }
 
 func (e *openAIResponsesStreamEncoder) nextItemID(prefix string) string {
@@ -2097,10 +2110,12 @@ func (e *openAIResponsesStreamEncoder) nextItemID(prefix string) string {
 	return fmt.Sprintf("%s_%d", prefix, e.itemCounter)
 }
 
-func singleOpenAIResponsesStreamEvent(event string, payload openAIResponsesStreamEvent) ([]RawStreamEvent, error) {
+func (e *openAIResponsesStreamEncoder) singleOpenAIResponsesStreamEvent(event string, payload openAIResponsesStreamEvent) ([]RawStreamEvent, error) {
+	payload.SequenceNumber = e.sequenceNumber
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
+	e.sequenceNumber++
 	return []RawStreamEvent{{Event: event, Data: raw}}, nil
 }
