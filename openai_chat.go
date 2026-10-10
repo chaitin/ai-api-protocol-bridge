@@ -472,7 +472,17 @@ func (e *openAIChatStreamEncoder) encodeUsageSummary() ([]RawStreamEvent, error)
 }
 
 func (e *openAIChatStreamEncoder) encodeStreamError(part StreamPart) ([]RawStreamEvent, error) {
-	raw, err := json.Marshal(openAIErrorResponse{Error: openAIError{Message: fmt.Sprint(part.Error), Type: "protocol_bridge_error"}})
+	// fmt.Sprint on a decoded error object produced its Go map rendering; read
+	// the message out instead so an upstream failure reaches the client intact.
+	message := errorMessage(part.Error)
+	if message == "" {
+		message = "unknown error"
+	}
+	kind := errorCode(part.Error)
+	if kind == "" {
+		kind = "protocol_bridge_error"
+	}
+	raw, err := json.Marshal(openAIErrorResponse{Error: openAIError{Message: message, Type: kind}})
 	if err != nil {
 		return nil, err
 	}

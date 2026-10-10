@@ -1393,6 +1393,12 @@ type openAIResponsesStreamEvent struct {
 	Usage          *openAIResponsesUsage             `json:"usage,omitempty"`
 	Error          any                               `json:"error,omitempty"`
 	Output         []openAIResponsesStreamItem       `json:"output,omitempty"`
+
+	// The bare error event carries its detail at the top level, unlike
+	// response.failed, which nests it under response.error.
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
+	Param   string `json:"param,omitempty"`
 }
 
 type openAIResponsesStreamResponse struct {
@@ -1638,12 +1644,44 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 		parts = append(parts, finish)
 		return parts, nil
 	case "response.failed":
-		return []StreamPart{{Type: StreamError, Error: raw.Error}}, nil
+		return []StreamPart{{Type: StreamError, Error: responsesStreamError(raw)}}, nil
 	case "error":
-		return []StreamPart{{Type: StreamError, Error: raw.Error}}, nil
+		return []StreamPart{{Type: StreamError, Error: responsesStreamError(raw)}}, nil
 	default:
 		return []StreamPart{{Type: StreamRaw, RawValue: raw}}, nil
 	}
+}
+
+// responsesStreamError pulls the provider error out of whichever place the
+// Responses API put it: nested under response.error for response.failed, or at
+// the top level for the bare error event. Reading only the top-level field, as
+// this decoder used to, turned every failed response into a nil error.
+func responsesStreamError(raw openAIResponsesStreamEvent) any {
+	if raw.Response != nil && raw.Response.Error != nil {
+		return raw.Response.Error
+	}
+	if raw.Error != nil {
+		return raw.Error
+	}
+	if raw.Message != "" || raw.Code != "" {
+		return map[string]any{"code": raw.Code, "message": raw.Message}
+	}
+	return nil
+}
+
+// responsesErrorObject renders a provider error as the ResponseError object
+// that response.error is specified to hold, dropping fields the upstream did
+// not supply instead of forwarding a foreign error shape verbatim.
+func responsesErrorObject(value any) map[string]any {
+	message := errorMessage(value)
+	if message == "" {
+		message = "unknown error"
+	}
+	object := map[string]any{"message": message}
+	if code := errorCode(value); code != "" {
+		object["code"] = code
+	}
+	return object
 }
 
 func (d *openAIResponsesStreamDecoder) rememberImageGenerationUsage(item openAIResponsesStreamItem, outputIndex *int) {
@@ -2090,7 +2128,10 @@ func (e *openAIResponsesStreamEncoder) encodeFinish(part StreamPart) ([]RawStrea
 		status = "failed"
 		eventType = "response.failed"
 	}
-	resp := openAIResponsesStreamResponse{ID: e.responseID, Object: "response", Status: status, Error: part.Error, IncompleteDetails: incompleteDetails, Model: e.model}
+	resp := openAIResponsesStreamResponse{ID: e.responseID, Object: "response", Status: status, IncompleteDetails: incompleteDetails, Model: e.model}
+	if part.Error != nil {
+		resp.Error = responsesErrorObject(part.Error)
+	}
 	if part.Usage.InputTokens != nil || part.Usage.OutputTokens != nil {
 		u := encodeOpenAIResponsesUsage(part.Usage, billingUsageForProtocol(ProtocolOpenAIResponses, part.Usage))
 		resp.Usage = &u
@@ -2102,7 +2143,19 @@ func (e *openAIResponsesStreamEncoder) encodeFinish(part StreamPart) ([]RawStrea
 }
 
 func (e *openAIResponsesStreamEncoder) encodeStreamError(part StreamPart) ([]RawStreamEvent, error) {
-	return e.singleOpenAIResponsesStreamEvent("error", openAIResponsesStreamEvent{Type: "error", Error: part.Error})
+	// The Responses error event carries code/message at the top level. Nesting
+	// them under "error", as this encoder used to, is not the documented shape
+	// and leaves codex without a message to show.
+	message := errorMessage(part.Error)
+	if message == "" {
+		message = "unknown error"
+	}
+	return e.singleOpenAIResponsesStreamEvent("error", openAIResponsesStreamEvent{
+		Type:    "error",
+		Message: message,
+		Code:    errorCode(part.Error),
+		Param:   errorParam(part.Error),
+	})
 }
 
 func (e *openAIResponsesStreamEncoder) nextItemID(prefix string) string {
