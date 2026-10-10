@@ -50,7 +50,7 @@ func (b openAIResponsesToAnthropicBridge) EncodeUpstreamRequest(req *LLMRequest,
 		request.Messages, previousWasTool = appendOpenAIInboundAnthropicMessage(request.Messages, message, previousWasTool)
 	}
 
-	applyAnthropicCache(&request, req.Cache)
+	applyAnthropicCache(&request, req.Cache, opts.CacheControl)
 	return json.Marshal(request)
 }
 

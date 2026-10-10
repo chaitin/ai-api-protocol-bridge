@@ -2,7 +2,34 @@ package protocolbridge
 
 type EncodeRequestOptions struct {
 	Model string
+
+	// CacheControl decides whether the Anthropic encoder may add a
+	// cache_control breakpoint of its own when the request does not express a
+	// caching preference. Anthropic only caches a prefix when a breakpoint asks
+	// it to, so Auto — the zero value — adds one; Disabled never does.
+	//
+	// The request's own preference always wins: a non-nil LLMRequest.Cache is
+	// honoured whatever this says.
+	CacheControl CacheControlPolicy
 }
+
+// CacheControlPolicy controls the cache_control breakpoint an Anthropic
+// request is encoded with.
+type CacheControlPolicy string
+
+const (
+	// CacheControlAuto adds one breakpoint when the request expresses no
+	// preference of its own. This is the default, and matches Anthropic's
+	// pricing: without a breakpoint nothing is cached, and an agent's long
+	// system prompt is paid for in full on every turn.
+	CacheControlAuto CacheControlPolicy = ""
+
+	// CacheControlDisabled never adds a breakpoint.
+	CacheControlDisabled CacheControlPolicy = "disabled"
+
+	// CacheControlEnabled adds a breakpoint even if the request would not.
+	CacheControlEnabled CacheControlPolicy = "enabled"
+)
 
 type EncodeResponseOptions struct {
 	Model string

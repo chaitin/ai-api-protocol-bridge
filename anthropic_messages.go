@@ -105,7 +105,7 @@ func (a AnthropicMessagesAdapter) EncodeRequest(req *LLMRequest, opts EncodeRequ
 		request.Messages = append(request.Messages, encoded)
 	}
 
-	applyAnthropicCache(&request, req.Cache)
+	applyAnthropicCache(&request, req.Cache, opts.CacheControl)
 	return json.Marshal(request)
 }
 
@@ -930,8 +930,22 @@ func anthropicContentHasCacheControl(content any) bool {
 	return false
 }
 
-func applyAnthropicCache(request *anthropicRequest, cache *bool) {
-	if request == nil || (cache != nil && !*cache) {
+// applyAnthropicCache adds a cache_control breakpoint to the last cacheable
+// block, which is what makes Anthropic cache the prefix.
+//
+// The request's own preference is authoritative: a non-nil cache is honoured
+// either way, so a caller that asked for caching gets it and a caller that
+// asked against it does not. Only when the source protocol has no notion of
+// caching at all (cache is nil) does the policy decide.
+func applyAnthropicCache(request *anthropicRequest, cache *bool, policy CacheControlPolicy) {
+	if request == nil {
+		return
+	}
+	if cache != nil {
+		if !*cache {
+			return
+		}
+	} else if policy == CacheControlDisabled {
 		return
 	}
 	cacheControl := &anthropicCacheControl{Type: "ephemeral"}
