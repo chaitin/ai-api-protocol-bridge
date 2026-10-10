@@ -100,10 +100,16 @@ func (a OpenAIResponsesAdapter) EncodeRequest(req *LLMRequest, opts EncodeReques
 			input = append(input, encodeOpenAIResponsesToolResults(message.Parts)...)
 			continue
 		}
-		input = append(input, openAIResponsesInputItem{
-			Role:    string(message.Role),
-			Content: encodeOpenAIResponsesInputContent(message.Role, message.Parts),
-		})
+		// An assistant turn that only called tools has no content to send, and
+		// an empty message item is not nothing: it asks the upstream to read a
+		// blank assistant turn. The call items below carry the turn on their
+		// own.
+		if content := encodeOpenAIResponsesInputContent(message.Role, message.Parts); len(content) > 0 {
+			input = append(input, openAIResponsesInputItem{
+				Role:    string(message.Role),
+				Content: content,
+			})
+		}
 		if message.Role == RoleAssistant {
 			input = append(input, encodeOpenAIResponsesToolCalls(message.Parts)...)
 		}

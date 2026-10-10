@@ -39,9 +39,17 @@ func TestNewCrossFamilyBridgeForProtocolDefersForExistingPairs(t *testing.T) {
 		{"anthropic to responses", ProtocolAnthropicMessages, ProtocolOpenAIResponses, true, ProtocolOpenAIResponses},
 		{"chat to anthropic", ProtocolOpenAIChat, ProtocolAnthropicMessages, true, ProtocolAnthropicMessages},
 		{"responses to anthropic", ProtocolOpenAIResponses, ProtocolAnthropicMessages, true, ProtocolAnthropicMessages},
-		// Same-family pairs are re-encoded through the shared adapters, not bridged.
-		{"chat to responses", ProtocolOpenAIChat, ProtocolOpenAIResponses, false, ""},
+		// Chat and Responses are one family but two wire formats, and no
+		// fallback resolves them: a family lookup returns nothing, and the
+		// caller's default of "reuse the inbound adapter" would post chat JSON
+		// at a Responses endpoint. So this pair needs a bridge like any other,
+		// even though both halves are just the two adapters.
+		{"chat to responses", ProtocolOpenAIChat, ProtocolOpenAIResponses, true, ProtocolOpenAIResponses},
+		{"responses to chat", ProtocolOpenAIResponses, ProtocolOpenAIChat, true, ProtocolOpenAIChat},
+		// Only the identity needs no bridge: it is re-encoded through the one
+		// shared adapter.
 		{"identical", ProtocolOpenAIChat, ProtocolOpenAIChat, false, ""},
+		{"identical responses", ProtocolOpenAIResponses, ProtocolOpenAIResponses, false, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -59,6 +59,8 @@ func NewCrossFamilyBridgeForProtocol(inbound, upstream Protocol) (CrossFamilyBri
 		return anthropicToOpenAIChatBridge{adapter: NewOpenAIChatAdapter()}, true
 	case inbound == ProtocolOpenAIResponses && upstream == ProtocolOpenAIChat:
 		return openAIResponsesToOpenAIChatBridge{adapter: NewOpenAIChatAdapter()}, true
+	case inbound == ProtocolOpenAIChat && upstream == ProtocolOpenAIResponses:
+		return openAIChatToOpenAIResponsesBridge{adapter: NewOpenAIResponsesAdapter()}, true
 	}
 	return NewCrossFamilyBridge(inbound, familyForProtocol(upstream))
 }
