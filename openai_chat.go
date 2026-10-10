@@ -585,15 +585,19 @@ func decodeOpenAIChatMessage(message openAIChatMessage) (Message, error) {
 		if err != nil {
 			return Message{}, err
 		}
+		output := ToolResultOutput{Type: ToolResultText, Text: joinTextParts(parts)}
+		// Keep media a chat client attached to a tool result. Flattening it to
+		// the text here would discard it before any other protocol could see
+		// it, and the encode side can put it back.
+		if hasNonTextPart(parts) {
+			output = ToolResultOutput{Type: ToolResultContent, Content: parts}
+		}
 		decoded.Parts = []Part{
 			{
 				Type: PartToolResult,
 				ToolResult: &ToolResultPart{
 					ToolCallID: message.ToolCallID,
-					Output: ToolResultOutput{
-						Type: ToolResultText,
-						Text: joinTextParts(parts),
-					},
+					Output:     output,
 				},
 			},
 		}
@@ -706,8 +710,18 @@ func withoutToolResultParts(message Message) Message {
 	return message
 }
 
+// encodeOpenAIToolMessages renders tool results as the chat protocol's tool
+// messages.
+//
+// A chat tool message carries text only, but a tool result may also hold media:
+// an Anthropic client such as Claude Code returns a screenshot, or an image it
+// read from disk, as an image block inside tool_result content. Flattening that
+// content to its text — which is what this function used to do — hands the
+// model an empty result, so the media is lifted into a single user message
+// emitted after all of the tool messages.
 func encodeOpenAIToolMessages(message Message) []openAIChatMessage {
 	encoded := make([]openAIChatMessage, 0)
+	var lifted []Part
 	for _, part := range message.Parts {
 		if part.Type != PartToolResult || part.ToolResult == nil {
 			continue
@@ -717,8 +731,52 @@ func encodeOpenAIToolMessages(message Message) []openAIChatMessage {
 			ToolCallID: part.ToolResult.ToolCallID,
 			Content:    encodeOpenAIToolOutput(part.ToolResult.Output),
 		})
+		lifted = append(lifted, toolResultMediaParts(part.ToolResult.Output)...)
+	}
+	if content := encodeOpenAITextContent(lifted); !isEmptyOpenAIContent(content) {
+		encoded = append(encoded, openAIChatMessage{Role: string(RoleUser), Content: content})
 	}
 	return encoded
+}
+
+// toolResultMediaParts returns the parts of a tool result that a chat tool
+// message cannot carry. Text is excluded because encodeOpenAIToolOutput already
+// places it in the tool message, and repeating it would duplicate the output.
+func toolResultMediaParts(output ToolResultOutput) []Part {
+	if output.Type != ToolResultContent {
+		return nil
+	}
+	parts := make([]Part, 0, len(output.Content))
+	for _, part := range output.Content {
+		if part.Type == PartText {
+			continue
+		}
+		parts = append(parts, part)
+	}
+	return parts
+}
+
+func hasNonTextPart(parts []Part) bool {
+	for _, part := range parts {
+		if part.Type != PartText {
+			return true
+		}
+	}
+	return false
+}
+
+// isEmptyOpenAIContent reports whether an encoded chat content value carries
+// nothing, so that callers do not emit an empty message.
+func isEmptyOpenAIContent(content any) bool {
+	switch typed := content.(type) {
+	case nil:
+		return true
+	case string:
+		return typed == ""
+	case []openAIChatContentPart:
+		return len(typed) == 0
+	}
+	return false
 }
 
 func encodeOpenAIAssistantMessage(content []Part) (openAIChatMessage, error) {
