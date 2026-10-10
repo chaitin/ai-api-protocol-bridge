@@ -850,6 +850,15 @@ func encodeOpenAITextContent(parts []Part, recorder *lossRecorder, path string) 
 			encoded = append(encoded, openAIChatContentPart{Type: "text", Text: part.Text.Text})
 			continue
 		}
+		if part.Type == PartReasoning && part.Reasoning != nil {
+			// Chat completions has no field for a thinking block or an
+			// encrypted reasoning item. The answer itself is unaffected, which
+			// is why this is informational rather than a loss.
+			recorder.report(LossDroppedReasoning, partPath,
+				"chat completions has no reasoning field, so this turn's reasoning was not sent upstream",
+				SeverityInfo)
+			continue
+		}
 		if part.Type == PartFile && part.File != nil && part.File.Type == FileImage {
 			url := encodeFileURL(part.File)
 			if url == "" {

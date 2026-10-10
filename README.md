@@ -26,14 +26,23 @@ AI API Protocol Bridge 是一个 Go 协议转换包，用来在 OpenAI 和 Anthr
 
 ## 支持的跨协议桥
 
-| 入口协议 | 上游模型家族 | 实际上游协议 |
-| --- | --- | --- |
-| OpenAI Chat Completions | Anthropic | Anthropic Messages |
-| OpenAI Responses | Anthropic | Anthropic Messages |
-| Anthropic Messages | OpenAI | OpenAI Responses |
+用 `NewCrossFamilyBridgeForProtocol(inbound, upstream)` 按**精确协议对**取桥：
 
-Anthropic 入口转 OpenAI 上游时，会使用 OpenAI Responses，而不是 OpenAI
-Chat Completions。
+| 入口协议 | 上游协议 | 说明 |
+| --- | --- | --- |
+| OpenAI Responses | OpenAI Chat Completions | codex 打到只支持 Chat 的上游 |
+| OpenAI Chat Completions | Anthropic Messages | |
+| OpenAI Responses | Anthropic Messages | |
+| Anthropic Messages | OpenAI Chat Completions | |
+| Anthropic Messages | OpenAI Responses | |
+| OpenAI Chat Completions | OpenAI Responses | 尚未支持 |
+
+同一家族内的协议对（如 Chat → Responses、Chat → Chat）返回 `false`。
+
+`NewCrossFamilyBridge(inbound, upstreamFamily)` 是按**家族**取桥的旧接口，仍然可用，
+但家族不足以定位目标：Anthropic 入口有两个 OpenAI 目标，家族查询一律返回
+Responses 桥，无论调用方实际想要哪个。已知上游协议时应改用
+`NewCrossFamilyBridgeForProtocol`。
 
 ## 安装
 

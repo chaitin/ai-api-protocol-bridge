@@ -22,7 +22,9 @@ type Severity string
 
 const (
 	// SeverityInfo records something that was rewritten into an equivalent
-	// form, or dropped without changing the answer.
+	// form, or dropped without changing the answer. It is never fatal: a host
+	// asking for strictness does not want a request refused over scratch data
+	// the model did not need.
 	SeverityInfo Severity = "info"
 
 	// SeverityWarning records content the target protocol cannot express, so
@@ -53,8 +55,9 @@ const (
 	// field for.
 	LossDroppedStopSequences = "dropped_stop_sequences"
 
-	// LossDroppedReasoning is reasoning content the target protocol cannot
-	// carry.
+	// LossDroppedReasoning is reasoning content the target protocol has no
+	// field for. Losing an earlier turn's reasoning is usually harmless, so the
+	// chat encoder reports it at SeverityInfo.
 	LossDroppedReasoning = "dropped_reasoning"
 
 	// LossDroppedChoice is an additional completion the target protocol can
@@ -74,7 +77,8 @@ const (
 	// needs, which is the error-severity losses, and allows the rest.
 	LossPolicySafe LossPolicy = "safe"
 
-	// LossPolicyStrict refuses any conversion that reported a loss.
+	// LossPolicyStrict refuses a conversion that dropped any content, which is
+	// every loss above SeverityInfo.
 	LossPolicyStrict LossPolicy = "strict"
 )
 
@@ -193,11 +197,15 @@ func rejectLosses(policy LossPolicy, warnings []Warning) error {
 		}
 		return &ConversionError{Warnings: rejected}
 	case LossPolicyStrict:
-		if len(warnings) == 0 {
+		rejected := make([]Warning, 0, len(warnings))
+		for _, warning := range warnings {
+			if warning.Severity != SeverityInfo {
+				rejected = append(rejected, warning)
+			}
+		}
+		if len(rejected) == 0 {
 			return nil
 		}
-		rejected := make([]Warning, len(warnings))
-		copy(rejected, warnings)
 		return &ConversionError{Warnings: rejected}
 	default:
 		return nil
