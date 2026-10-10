@@ -73,7 +73,7 @@ func (b openAIResponsesToAnthropicBridge) NewStreamDecoder(opts StreamDecodeOpti
 }
 
 func (b openAIResponsesToAnthropicBridge) NewStreamEncoder(opts StreamEncodeOptions) (StreamEncoder, error) {
-	return &anthropicToOpenAIResponsesStreamEncoder{base: openAIResponsesStreamEncoder{model: opts.Model}}, nil
+	return &anthropicToOpenAIResponsesStreamEncoder{base: newOpenAIResponsesStreamEncoder(opts)}, nil
 }
 
 type anthropicToOpenAIResponsesStreamEncoder struct {

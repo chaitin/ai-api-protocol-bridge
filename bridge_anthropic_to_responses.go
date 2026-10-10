@@ -85,7 +85,7 @@ func (b anthropicToOpenAIResponsesBridge) NewStreamDecoder(opts StreamDecodeOpti
 }
 
 func (b anthropicToOpenAIResponsesBridge) NewStreamEncoder(opts StreamEncodeOptions) (StreamEncoder, error) {
-	return &openAIResponsesToAnthropicStreamEncoder{ant: anthropicStreamEncoder{model: opts.Model}}, nil
+	return &openAIResponsesToAnthropicStreamEncoder{ant: newAnthropicStreamEncoder(opts)}, nil
 }
 
 func anthropicBridgeInputItemsForMessage(message Message) []openAIResponsesInputItem {

@@ -246,7 +246,15 @@ func (a OpenAIResponsesAdapter) NewStreamDecoder(StreamDecodeOptions) (StreamDec
 }
 
 func (a OpenAIResponsesAdapter) NewStreamEncoder(opts StreamEncodeOptions) (StreamEncoder, error) {
-	return &openAIResponsesStreamEncoder{model: opts.Model}, nil
+	encoder := newOpenAIResponsesStreamEncoder(opts)
+	return &encoder, nil
+}
+
+// newOpenAIResponsesStreamEncoder is the one place a Responses stream encoder is
+// built. See newOpenAIChatStreamEncoder for why the bridges must not assemble one
+// themselves. Responses events carry no timestamp, so Created has no effect here.
+func newOpenAIResponsesStreamEncoder(opts StreamEncodeOptions) openAIResponsesStreamEncoder {
+	return openAIResponsesStreamEncoder{onWarning: opts.OnWarning, model: opts.Model}
 }
 
 func (a OpenAIResponsesAdapter) EncodeError(err error) ([]byte, int) {
@@ -1904,6 +1912,7 @@ func (d *openAIResponsesStreamDecoder) Close() ([]StreamPart, error) {
 }
 
 type openAIResponsesStreamEncoder struct {
+	onWarning      func(Warning)
 	model          string
 	started        bool
 	finished       bool
@@ -2079,7 +2088,11 @@ func (e *openAIResponsesStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent
 	case StreamError:
 		return e.encodeStreamError(part)
 	case StreamRaw:
-		return e.singleOpenAIResponsesStreamEvent("raw", openAIResponsesStreamEvent{Type: "raw", Delta: rawStreamText(part.RawValue)})
+		// The "raw" event this used to emit was a type no Responses client has
+		// ever heard of. The frame goes to the host's callback instead.
+		reportStreamLoss(e.onWarning, ProtocolOpenAIResponses, LossUnsupportedStreamEvent, "stream",
+			"an upstream stream event this package does not model was not forwarded", rawStreamText(part.RawValue))
+		return nil, nil
 	default:
 		return nil, nil
 	}

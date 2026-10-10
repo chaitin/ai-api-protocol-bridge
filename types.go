@@ -489,4 +489,10 @@ type Warning struct {
 
 	From Protocol `json:"from,omitempty"`
 	To   Protocol `json:"to,omitempty"`
+
+	// Detail carries the text a loss refers to when the loss is itself some text
+	// that had nowhere to go — an upstream stream frame this package does not
+	// model, for instance. It is empty for losses that are a field or a value
+	// rather than a payload.
+	Detail string `json:"detail,omitempty"`
 }

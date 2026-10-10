@@ -195,7 +195,15 @@ func (a AnthropicMessagesAdapter) NewStreamDecoder(StreamDecodeOptions) (StreamD
 }
 
 func (a AnthropicMessagesAdapter) NewStreamEncoder(opts StreamEncodeOptions) (StreamEncoder, error) {
-	return &anthropicStreamEncoder{model: opts.Model}, nil
+	encoder := newAnthropicStreamEncoder(opts)
+	return &encoder, nil
+}
+
+// newAnthropicStreamEncoder is the one place an Anthropic stream encoder is
+// built. See newOpenAIChatStreamEncoder for why the bridges must not assemble one
+// themselves. Anthropic events carry no timestamp, so Created has no effect here.
+func newAnthropicStreamEncoder(opts StreamEncodeOptions) anthropicStreamEncoder {
+	return anthropicStreamEncoder{onWarning: opts.OnWarning, model: opts.Model}
 }
 
 func (a AnthropicMessagesAdapter) EncodeError(err error) ([]byte, int) {
@@ -378,6 +386,7 @@ func decodeAnthropicContentBlockDelta(raw anthropicStreamEvent, toolID string) [
 }
 
 type anthropicStreamEncoder struct {
+	onWarning    func(Warning)
 	model        string
 	nextIndex    int
 	activeText   map[string]int
@@ -511,8 +520,11 @@ func (e *anthropicStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent, erro
 		}
 		return singleAnthropicStreamEvent("error", anthropicStreamEvent{Type: "error", Error: anthropicError{Type: anthropicErrorType(part.Error), Message: message}})
 	case StreamRaw:
-		delta := anthropicStreamDelta{Type: "raw", Text: rawStreamText(part.RawValue)}
-		return singleAnthropicStreamEvent("raw", anthropicStreamEvent{Type: "raw", Delta: &delta})
+		// The "raw" event this used to emit was a type no Anthropic client has
+		// ever heard of. The frame goes to the host's callback instead.
+		reportStreamLoss(e.onWarning, ProtocolAnthropicMessages, LossUnsupportedStreamEvent, "stream",
+			"an upstream stream event this package does not model was not forwarded", rawStreamText(part.RawValue))
+		return nil, nil
 	default:
 		return nil, nil
 	}

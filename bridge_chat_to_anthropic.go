@@ -67,7 +67,7 @@ func (b openAIChatToAnthropicBridge) NewStreamDecoder(opts StreamDecodeOptions) 
 }
 
 func (b openAIChatToAnthropicBridge) NewStreamEncoder(opts StreamEncodeOptions) (StreamEncoder, error) {
-	return &anthropicToOpenAIChatStreamEncoder{base: openAIChatStreamEncoder{model: opts.Model, toolIndexes: make(map[string]int)}}, nil
+	return &anthropicToOpenAIChatStreamEncoder{base: newOpenAIChatStreamEncoder(opts)}, nil
 }
 
 type anthropicToOpenAIChatStreamEncoder struct {

@@ -60,6 +60,11 @@ const (
 	// to ask for. The request is served without it.
 	LossUnsupportedInclude = "unsupported_include"
 
+	// LossUnsupportedStreamEvent is a streaming event the target protocol has no
+	// representation for, so it was not forwarded. The frame itself is carried on
+	// Warning.Detail for a host that wants it.
+	LossUnsupportedStreamEvent = "unsupported_stream_event"
+
 	// LossDroppedReasoning is reasoning content the target protocol has no
 	// field for. Losing an earlier turn's reasoning is usually harmless, so the
 	// chat encoder reports it at SeverityInfo.
@@ -200,6 +205,32 @@ func protocolLabel(protocol Protocol) string {
 	default:
 		return string(protocol)
 	}
+}
+
+// reportStreamLoss hands a mid-stream loss to the host's callback.
+//
+// There is nowhere else for one to go. The encoder's other output is wire frames,
+// and no client protocol has a field for a warning, so the only way to report one
+// on the wire would be to put a field there that other implementations have never
+// seen — which is what an upstream or downstream that is not an official
+// implementation tends to reject. A host that registers no callback loses these
+// exactly as it did before the callback existed, which is what makes the callback
+// safe to add.
+//
+// Only the protocol being written is known here, so such a warning carries To and
+// leaves From empty.
+func reportStreamLoss(onWarning func(Warning), to Protocol, code, path, message, detail string) {
+	if onWarning == nil {
+		return
+	}
+	onWarning(Warning{
+		Code:     code,
+		Path:     path,
+		Message:  message,
+		Severity: SeverityInfo,
+		To:       to,
+		Detail:   detail,
+	})
 }
 
 // reportUnsupportedInclude records the include entries a target protocol has no

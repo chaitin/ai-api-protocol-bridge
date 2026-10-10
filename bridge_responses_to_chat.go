@@ -46,7 +46,7 @@ func (b openAIResponsesToOpenAIChatBridge) NewStreamDecoder(opts StreamDecodeOpt
 }
 
 func (b openAIResponsesToOpenAIChatBridge) NewStreamEncoder(opts StreamEncodeOptions) (StreamEncoder, error) {
-	return &responsesStreamEncoderForChatUpstream{res: openAIResponsesStreamEncoder{model: opts.Model}}, nil
+	return &responsesStreamEncoderForChatUpstream{res: newOpenAIResponsesStreamEncoder(opts)}, nil
 }
 
 // responsesStreamEncoderForChatUpstream writes neutral stream parts as OpenAI

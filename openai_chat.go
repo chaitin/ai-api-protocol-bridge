@@ -206,14 +206,26 @@ func (a OpenAIChatAdapter) NewStreamDecoder(StreamDecodeOptions) (StreamDecoder,
 }
 
 func (a OpenAIChatAdapter) NewStreamEncoder(opts StreamEncodeOptions) (StreamEncoder, error) {
-	return &openAIChatStreamEncoder{model: opts.Model, created: opts.Created, toolIndexes: make(map[string]int)}, nil
+	encoder := newOpenAIChatStreamEncoder(opts)
+	return &encoder, nil
+}
+
+// newOpenAIChatStreamEncoder is the one place a chat stream encoder is built.
+//
+// The bridges used to assemble one out of opts field by field, which silently
+// dropped any option nobody remembered to add — Created was lost by five of the
+// six, and OnWarning would have been lost by all of them. Building from the
+// options struct means a new option reaches every caller or none.
+func newOpenAIChatStreamEncoder(opts StreamEncodeOptions) openAIChatStreamEncoder {
+	return openAIChatStreamEncoder{
+		onWarning:   opts.OnWarning,
+		model:       opts.Model,
+		created:     opts.Created,
+		toolIndexes: make(map[string]int),
+	}
 }
 
 type openAIChatStreamChunk struct {
-	// Raw carries an upstream frame this package does not model. It is an
-	// extension field: a client that only reads choices ignores it.
-	Raw string `json:"protocol_bridge_raw,omitempty"`
-
 	ID      string                      `json:"id"`
 	Object  string                      `json:"object"`
 	Created int64                       `json:"created"`
@@ -365,6 +377,7 @@ func (d *openAIChatStreamDecoder) Close() ([]StreamPart, error) {
 }
 
 type openAIChatStreamEncoder struct {
+	onWarning   func(Warning)
 	model       string
 	responseID  string
 	created     int64
@@ -440,19 +453,15 @@ func (e *openAIChatStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent, err
 	case StreamError:
 		return e.encodeStreamError(part)
 	case StreamRaw:
-		// An unmodelled upstream frame is not model output, and chat has no
-		// raw-event slot. Emitting it as content is what put Go syntax in the
-		// assistant's answer, so the frame rides in an extension field instead:
-		// a host logging the stream still sees it, and a client reading content
-		// does not.
-		chunk := openAIChatStreamChunk{
-			Object:  "chat.completion.chunk",
-			Model:   e.model,
-			Created: e.timestamp(),
-			Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{}}},
-			Raw:     rawStreamText(part.RawValue),
-		}
-		return singleOpenAIChatStreamEvent(chunk)
+		// An unmodelled upstream frame is not model output, so it must not become
+		// content — that is what put Go syntax in the assistant's answer. Chat has
+		// no raw-event slot either, and inventing a field for one would put
+		// something on the wire no other implementation expects. The frame is
+		// dropped and offered to the host's callback, which is where a host that
+		// cares about it can pick it up.
+		reportStreamLoss(e.onWarning, ProtocolOpenAIChat, LossUnsupportedStreamEvent, "stream",
+			"an upstream stream event this package does not model was not forwarded", rawStreamText(part.RawValue))
+		return nil, nil
 	default:
 		return nil, nil
 	}

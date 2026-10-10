@@ -55,6 +55,17 @@ type StreamDecodeOptions struct{}
 type StreamEncodeOptions struct {
 	Model string
 
+	// OnWarning, when set, receives the losses a stream conversion has to incur
+	// mid-flight — an upstream frame this package does not model, for instance.
+	//
+	// It is optional on purpose. A mid-stream loss has no wire representation, so
+	// without a callback there is nowhere to put it, and the frame is dropped
+	// exactly as it was before callbacks existed. Registering one adds a way to
+	// see those losses; it never changes the bytes a client receives.
+	//
+	// The callback runs on the goroutine driving the stream and must not block.
+	OnWarning func(Warning)
+
 	// Created is the Unix timestamp in seconds to stamp on every event of the
 	// stream. Zero means "stamp the first event and reuse that value", which is
 	// what a real provider does: one timestamp for the whole completion.
