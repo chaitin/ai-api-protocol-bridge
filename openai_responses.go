@@ -62,8 +62,13 @@ func (a OpenAIResponsesAdapter) EncodeRequest(req *LLMRequest, opts EncodeReques
 	if req == nil {
 		return nil, errors.New("encode openai responses request: nil request")
 	}
+	recorder := newLossRecorder(req.Protocol, ProtocolOpenAIResponses)
 	if len(req.StopSequences) > 0 {
-		return nil, errors.New("encode openai responses request: stop sequences are not supported")
+		// The Responses API has no stop field, so there is nowhere to put
+		// these. Report it and let LossPolicy decide whether it is fatal.
+		recorder.report(LossDroppedStopSequences, "stop_sequences",
+			fmt.Sprintf("the Responses API has no stop field, so stop sequences %v were dropped and the model may generate past them", req.StopSequences),
+			SeverityWarning)
 	}
 
 	model := req.Model
@@ -105,6 +110,9 @@ func (a OpenAIResponsesAdapter) EncodeRequest(req *LLMRequest, opts EncodeReques
 	}
 	request.Input = input
 
+	if err := recorder.attachTo(req, opts.LossPolicy); err != nil {
+		return nil, err
+	}
 	return json.Marshal(request)
 }
 

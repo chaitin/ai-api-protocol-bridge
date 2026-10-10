@@ -55,6 +55,11 @@ type LLMRequest struct {
 	Metadata map[string]string `json:"metadata,omitempty"`
 
 	ProviderOptions map[string]any `json:"provider_options,omitempty"`
+
+	// Warnings collects what decoding the inbound request, and then encoding it
+	// for the upstream, could not carry across. A host should read it after
+	// encoding; LossPolicy can turn the unacceptable ones into an error.
+	Warnings []Warning `json:"warnings,omitempty"`
 }
 
 type Message struct {
@@ -415,7 +420,19 @@ func billingUsageForProtocol(protocol Protocol, usage Usage) BillingUsage {
 	}
 }
 
+// Warning is one thing a conversion could not carry across, reported by the
+// decoder or encoder that hit it. See Severity for what the grades mean and the
+// Loss* constants for the codes.
 type Warning struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+
+	Severity Severity `json:"severity,omitempty"`
+
+	// Path locates the loss inside the request, such as
+	// "messages[3].content[1]".
+	Path string `json:"path,omitempty"`
+
+	From Protocol `json:"from,omitempty"`
+	To   Protocol `json:"to,omitempty"`
 }

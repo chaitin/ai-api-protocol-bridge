@@ -93,12 +93,16 @@ func (a OpenAIChatAdapter) EncodeRequest(req *LLMRequest, opts EncodeRequestOpti
 		ParallelToolCalls:   req.ParallelToolCalls,
 		Stream:              req.Stream,
 	}
-	for _, message := range req.Prompt {
-		encoded, err := encodeOpenAIChatMessages(message)
+	recorder := newLossRecorder(req.Protocol, ProtocolOpenAIChat)
+	for i, message := range req.Prompt {
+		encoded, err := encodeOpenAIChatMessages(message, recorder, fmt.Sprintf("messages[%d]", i))
 		if err != nil {
 			return nil, err
 		}
 		request.Messages = append(request.Messages, encoded...)
+	}
+	if err := recorder.attachTo(req, opts.LossPolicy); err != nil {
+		return nil, err
 	}
 
 	return json.Marshal(request)
@@ -154,17 +158,18 @@ func (a OpenAIChatAdapter) EncodeResponse(resp *LLMResponse, opts EncodeResponse
 		model = opts.Model
 	}
 
+	recorder := newLossRecorder(resp.Protocol, ProtocolOpenAIChat)
 	choices := make([]openAIChatChoice, 0)
 	if len(resp.Choices) > 0 {
-		for _, choice := range resp.Choices {
-			message, err := encodeOpenAIAssistantMessage(choice.Content)
+		for i, choice := range resp.Choices {
+			message, err := encodeOpenAIAssistantMessage(choice.Content, recorder, fmt.Sprintf("choices[%d].message.content", i))
 			if err != nil {
 				return nil, err
 			}
 			choices = append(choices, openAIChatChoice{Index: choice.Index, Message: message, FinishReason: encodeOpenAIFinishReason(choice.FinishReason)})
 		}
 	} else {
-		message, err := encodeOpenAIAssistantMessage(resp.Content)
+		message, err := encodeOpenAIAssistantMessage(resp.Content, recorder, "message.content")
 		if err != nil {
 			return nil, err
 		}
@@ -636,9 +641,9 @@ func encodeOpenAIStreamOptions(stream bool) any {
 	return map[string]any{"include_usage": true}
 }
 
-func encodeOpenAIChatMessages(message Message) ([]openAIChatMessage, error) {
+func encodeOpenAIChatMessages(message Message, recorder *lossRecorder, path string) ([]openAIChatMessage, error) {
 	if message.Role == RoleTool {
-		return encodeOpenAIToolMessages(message), nil
+		return encodeOpenAIToolMessages(message, recorder, path), nil
 	}
 
 	// A tool result does not have to arrive as a tool-role message: Anthropic
@@ -649,12 +654,12 @@ func encodeOpenAIChatMessages(message Message) ([]openAIChatMessage, error) {
 	// requires them (directly after the assistant turn that made the call), and
 	// encode anything else the message carries under its own role.
 	if hasToolResultPart(message.Parts) {
-		encoded := encodeOpenAIToolMessages(message)
+		encoded := encodeOpenAIToolMessages(message, recorder, path)
 		remaining := withoutToolResultParts(message)
 		if len(remaining.Parts) == 0 {
 			return encoded, nil
 		}
-		rest, err := encodeOpenAIChatMessages(remaining)
+		rest, err := encodeOpenAIChatMessages(remaining, recorder, path)
 		if err != nil {
 			return nil, err
 		}
@@ -663,7 +668,7 @@ func encodeOpenAIChatMessages(message Message) ([]openAIChatMessage, error) {
 
 	encoded := openAIChatMessage{
 		Role:    string(message.Role),
-		Content: encodeOpenAITextContent(message.Parts),
+		Content: encodeOpenAITextContent(message.Parts, recorder, path+".content"),
 	}
 
 	for _, part := range message.Parts {
@@ -727,7 +732,7 @@ func withoutToolResultParts(message Message) Message {
 // content to its text — which is what this function used to do — hands the
 // model an empty result, so the media is lifted into a single user message
 // emitted after all of the tool messages.
-func encodeOpenAIToolMessages(message Message) []openAIChatMessage {
+func encodeOpenAIToolMessages(message Message, recorder *lossRecorder, path string) []openAIChatMessage {
 	encoded := make([]openAIChatMessage, 0)
 	var lifted []Part
 	for _, part := range message.Parts {
@@ -741,7 +746,7 @@ func encodeOpenAIToolMessages(message Message) []openAIChatMessage {
 		})
 		lifted = append(lifted, toolResultMediaParts(part.ToolResult.Output)...)
 	}
-	if content := encodeOpenAITextContent(lifted); !isEmptyOpenAIContent(content) {
+	if content := encodeOpenAITextContent(lifted, recorder, path+".content"); !isEmptyOpenAIContent(content) {
 		encoded = append(encoded, openAIChatMessage{Role: string(RoleUser), Content: content})
 	}
 	return encoded
@@ -787,9 +792,9 @@ func isEmptyOpenAIContent(content any) bool {
 	return false
 }
 
-func encodeOpenAIAssistantMessage(content []Part) (openAIChatMessage, error) {
+func encodeOpenAIAssistantMessage(content []Part, recorder *lossRecorder, path string) (openAIChatMessage, error) {
 	message := Message{Role: RoleAssistant, Parts: content}
-	encoded, err := encodeOpenAIChatMessages(message)
+	encoded, err := encodeOpenAIChatMessages(message, recorder, path)
 	if err != nil {
 		return openAIChatMessage{}, err
 	}
@@ -837,9 +842,10 @@ func decodeOpenAIChatContent(raw json.RawMessage) ([]Part, error) {
 	return decoded, nil
 }
 
-func encodeOpenAITextContent(parts []Part) any {
+func encodeOpenAITextContent(parts []Part, recorder *lossRecorder, path string) any {
 	encoded := make([]openAIChatContentPart, 0, len(parts))
-	for _, part := range parts {
+	for i, part := range parts {
+		partPath := fmt.Sprintf("%s[%d]", path, i)
 		if part.Type == PartText && part.Text != nil {
 			encoded = append(encoded, openAIChatContentPart{Type: "text", Text: part.Text.Text})
 			continue
@@ -847,6 +853,7 @@ func encodeOpenAITextContent(parts []Part) any {
 		if part.Type == PartFile && part.File != nil && part.File.Type == FileImage {
 			url := encodeFileURL(part.File)
 			if url == "" {
+				recorder.reportUnsupportedFile(partPath, part.File)
 				continue
 			}
 			encoded = append(encoded, openAIChatContentPart{Type: "image_url", ImageURL: &openAIChatImageURL{URL: url, Detail: part.File.Detail}})
@@ -855,6 +862,10 @@ func encodeOpenAITextContent(parts []Part) any {
 		if part.Type == PartFile && part.File != nil && part.File.Type == FileDocument {
 			file := openAIChatFilePart{FileData: part.File.Data, FileID: part.File.FileID, Filename: part.File.Filename}
 			if file.FileData == "" && file.FileID == "" {
+				// The chat file part carries inline data or a provider file id
+				// only. A document that arrives as a plain URL has nowhere to
+				// go here.
+				recorder.reportUnsupportedFile(partPath, part.File)
 				continue
 			}
 			encoded = append(encoded, openAIChatContentPart{Type: "file", File: &file})

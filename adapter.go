@@ -11,6 +11,11 @@ type EncodeRequestOptions struct {
 	// The request's own preference always wins: a non-nil LLMRequest.Cache is
 	// honoured whatever this says.
 	CacheControl CacheControlPolicy
+
+	// LossPolicy decides whether a loss the conversion had to incur fails the
+	// call. The zero value, LossPolicyAllow, records the losses on
+	// LLMRequest.Warnings and completes the request.
+	LossPolicy LossPolicy
 }
 
 // CacheControlPolicy controls the cache_control breakpoint an Anthropic
@@ -38,6 +43,11 @@ type EncodeResponseOptions struct {
 	// means "use the current time"; hosts that need deterministic output for
 	// snapshots or caching should set it.
 	Created int64
+
+	// LossPolicy decides whether a loss the conversion had to incur fails the
+	// call. The zero value, LossPolicyAllow, records the losses on
+	// LLMResponse.Warnings and completes the response.
+	LossPolicy LossPolicy
 }
 
 type StreamDecodeOptions struct{}

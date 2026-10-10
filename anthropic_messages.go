@@ -90,12 +90,15 @@ func (a AnthropicMessagesAdapter) EncodeRequest(req *LLMRequest, opts EncodeRequ
 	request.Thinking = encodeAnthropicThinking(req.Reasoning, req.ReasoningBudgetTokens, request.MaxTokens)
 	request.ToolChoice = encodeAnthropicToolChoice(sanitizeAnthropicToolChoice(req.ToolChoice, request.Thinking), req.ParallelToolCalls)
 
-	for _, message := range req.Prompt {
+	recorder := newLossRecorder(req.Protocol, ProtocolAnthropicMessages)
+	reportUnsupportedAnthropicTools(recorder, req.Tools)
+
+	for i, message := range req.Prompt {
 		if message.Role == RoleSystem || message.Role == RoleDeveloper {
 			request.System = appendSystemText(request.System, joinTextParts(message.Parts))
 			continue
 		}
-		encoded := encodeAnthropicMessage(message)
+		encoded := encodeAnthropicMessage(message, recorder, fmt.Sprintf("messages[%d]", i))
 		if message.Role == RoleTool {
 			encoded.Role = string(RoleUser)
 		}
@@ -106,6 +109,9 @@ func (a AnthropicMessagesAdapter) EncodeRequest(req *LLMRequest, opts EncodeRequ
 	}
 
 	applyAnthropicCache(&request, req.Cache, opts.CacheControl)
+	if err := recorder.attachTo(req, opts.LossPolicy); err != nil {
+		return nil, err
+	}
 	return json.Marshal(request)
 }
 
@@ -161,17 +167,21 @@ func (a AnthropicMessagesAdapter) EncodeResponse(resp *LLMResponse, opts EncodeR
 	}
 
 	content, finishReason := firstResponseContent(resp)
+	recorder := newLossRecorder(resp.Protocol, ProtocolAnthropicMessages)
 	response := anthropicResponse{
 		ID:         resp.ID,
 		Type:       "message",
 		Role:       string(RoleAssistant),
 		Model:      model,
-		Content:    encodeAnthropicContent(content),
+		Content:    encodeAnthropicContent(content, recorder, "content"),
 		StopReason: encodeAnthropicStopReason(finishReason),
 		Usage:      encodeAnthropicUsage(resp.Usage, resp.BillingUsage()),
 	}
 	if finishReason == FinishContentFilter {
 		response.StopDetails = &anthropicStopDetails{Type: "refusal", Explanation: firstRefusalText(content)}
+	}
+	if err := recorder.attachToResponse(resp, opts.LossPolicy); err != nil {
+		return nil, err
 	}
 
 	return json.Marshal(response)
@@ -649,10 +659,10 @@ func intValueOrZero(value *int) int {
 	return *value
 }
 
-func encodeAnthropicMessage(message Message) anthropicMessage {
+func encodeAnthropicMessage(message Message, recorder *lossRecorder, path string) anthropicMessage {
 	return anthropicMessage{
 		Role:    string(message.Role),
-		Content: encodeAnthropicContent(message.Parts),
+		Content: encodeAnthropicContent(message.Parts, recorder, path+".content"),
 	}
 }
 
@@ -696,9 +706,15 @@ func decodeAnthropicContent(blocks []anthropicContentBlock) []Part {
 	return parts
 }
 
-func encodeAnthropicContent(parts []Part) []anthropicContentBlock {
+func encodeAnthropicContent(parts []Part, recorder *lossRecorder, path string) []anthropicContentBlock {
 	blocks := make([]anthropicContentBlock, 0, len(parts))
-	for _, part := range parts {
+	for i, part := range parts {
+		partPath := path
+		if partPath == "" {
+			partPath = fmt.Sprintf("[%d]", i)
+		} else if !strings.HasSuffix(partPath, "]") {
+			partPath = fmt.Sprintf("%s[%d]", partPath, i)
+		}
 		switch part.Type {
 		case PartText:
 			if part.Text != nil {
@@ -720,9 +736,13 @@ func encodeAnthropicContent(parts []Part) []anthropicContentBlock {
 			if part.File != nil {
 				if block, ok := encodeAnthropicFile(part.File); ok {
 					blocks = append(blocks, block)
-				} else {
-					blocks = append(blocks, anthropicContentBlock{Type: "text", Text: unsupportedFileWarningText(part.File)})
+					break
 				}
+				// Anthropic cannot take this file. Report it rather than
+				// writing a warning into the conversation, which would change
+				// what the model is asked about and invalidate the cached
+				// prefix.
+				recorder.reportUnsupportedFile(partPath, part.File)
 			}
 		case PartToolCall:
 			if part.ToolCall != nil {
@@ -730,7 +750,7 @@ func encodeAnthropicContent(parts []Part) []anthropicContentBlock {
 			}
 		case PartToolResult:
 			if part.ToolResult != nil {
-				blocks = append(blocks, encodeAnthropicToolResult(part.ToolResult))
+				blocks = append(blocks, encodeAnthropicToolResult(part.ToolResult, recorder, partPath+".content"))
 			}
 		}
 	}
@@ -787,23 +807,6 @@ func encodeAnthropicFile(file *FilePart) (anthropicContentBlock, bool) {
 	return anthropicContentBlock{Type: blockType, Source: source, Title: file.Filename}, true
 }
 
-func unsupportedFileWarningText(file *FilePart) string {
-	if file == nil {
-		return "[Proxy warning: an unsupported file input was omitted while converting to Anthropic Messages.]"
-	}
-	identifier := strings.TrimSpace(file.Filename)
-	if identifier == "" {
-		identifier = strings.TrimSpace(file.FileID)
-	}
-	if identifier == "" {
-		identifier = strings.TrimSpace(file.MediaType)
-	}
-	if identifier == "" {
-		identifier = "unknown file"
-	}
-	return fmt.Sprintf("[Proxy warning: file input %q could not be converted to Anthropic Messages and was omitted. Provide a URL, base64 image, PDF, or plain text content instead.]", identifier)
-}
-
 func decodeAnthropicToolResult(block anthropicContentBlock) ToolResultOutput {
 	outputType := ToolResultText
 	if block.IsError {
@@ -828,13 +831,13 @@ func decodeAnthropicToolResult(block anthropicContentBlock) ToolResultOutput {
 	return ToolResultOutput{Type: outputType, Text: text}
 }
 
-func encodeAnthropicToolResult(result *ToolResultPart) anthropicContentBlock {
+func encodeAnthropicToolResult(result *ToolResultPart, recorder *lossRecorder, path string) anthropicContentBlock {
 	block := anthropicContentBlock{Type: "tool_result", ToolUseID: result.ToolCallID}
 	if result.Output.Type == ToolResultErrorText || result.Output.Type == ToolResultErrorJSON {
 		block.IsError = true
 	}
 	if result.Output.Type == ToolResultContent {
-		block.Content = encodeAnthropicContent(result.Output.Content)
+		block.Content = encodeAnthropicContent(result.Output.Content, recorder, path)
 	} else {
 		block.Content = encodeToolResultText(result.Output)
 	}
@@ -1074,9 +1077,10 @@ func encodeAnthropicTools(tools []Tool) []anthropicTool {
 	return encoded
 }
 
-func unsupportedAnthropicToolWarnings(tools []Tool) []string {
-	warnings := make([]string, 0)
-	for _, tool := range tools {
+// reportUnsupportedAnthropicTools records the tools an Anthropic request cannot
+// carry, which the model therefore cannot call.
+func reportUnsupportedAnthropicTools(recorder *lossRecorder, tools []Tool) {
+	for i, tool := range tools {
 		if tool.Type == ToolFunction {
 			continue
 		}
@@ -1087,9 +1091,10 @@ func unsupportedAnthropicToolWarnings(tools []Tool) []string {
 		if name == "" {
 			name = "provider-defined tool"
 		}
-		warnings = append(warnings, fmt.Sprintf("OpenAI Responses tool %q is not available when proxying to Anthropic and was omitted.", name))
+		recorder.report(LossUnsupportedTool, fmt.Sprintf("tools[%d]", i),
+			fmt.Sprintf("tool %q has no Anthropic equivalent and was omitted, so the model cannot call it", name),
+			SeverityError)
 	}
-	return warnings
 }
 
 func decodeAnthropicToolChoice(choice *anthropicToolChoice) *ToolChoice {

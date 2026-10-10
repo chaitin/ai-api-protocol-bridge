@@ -16,8 +16,8 @@ func encodeAnthropicThinkingForOpenAIInbound(req *LLMRequest, maxTokens *int) an
 	return thinking
 }
 
-func appendOpenAIInboundAnthropicMessage(messages []anthropicMessage, message Message, previousWasTool bool) ([]anthropicMessage, bool) {
-	encoded, ok := encodeOpenAIInboundAnthropicMessage(message)
+func appendOpenAIInboundAnthropicMessage(messages []anthropicMessage, message Message, previousWasTool bool, recorder *lossRecorder, path string) ([]anthropicMessage, bool) {
+	encoded, ok := encodeOpenAIInboundAnthropicMessage(message, recorder, path)
 	if !ok {
 		return messages, previousWasTool && message.Role == RoleTool
 	}
@@ -39,7 +39,7 @@ func appendOpenAIInboundAnthropicMessage(messages []anthropicMessage, message Me
 	return append(messages, encoded), true
 }
 
-func encodeOpenAIInboundAnthropicMessage(message Message) (anthropicMessage, bool) {
+func encodeOpenAIInboundAnthropicMessage(message Message, recorder *lossRecorder, path string) (anthropicMessage, bool) {
 	parts := openAIInboundAnthropicParts(message.Parts)
 	if len(parts) == 0 {
 		return anthropicMessage{}, false
@@ -51,7 +51,7 @@ func encodeOpenAIInboundAnthropicMessage(message Message) (anthropicMessage, boo
 	}
 	return anthropicMessage{
 		Role:    string(role),
-		Content: encodeAnthropicContent(parts),
+		Content: encodeAnthropicContent(parts, recorder, path+".content"),
 	}, true
 }
 

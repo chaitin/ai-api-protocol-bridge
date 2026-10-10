@@ -37,17 +37,23 @@ func (b openAIChatToAnthropicBridge) EncodeUpstreamRequest(req *LLMRequest, opts
 	request.Thinking = encodeAnthropicThinkingForOpenAIInbound(req, request.MaxTokens)
 	request.ToolChoice = encodeAnthropicToolChoice(sanitizeAnthropicToolChoice(req.ToolChoice, request.Thinking), req.ParallelToolCalls)
 
+	recorder := newLossRecorder(req.Protocol, ProtocolAnthropicMessages)
+	reportUnsupportedAnthropicTools(recorder, req.Tools)
+
 	previousWasTool := false
-	for _, message := range req.Prompt {
+	for i, message := range req.Prompt {
 		if message.Role == RoleSystem || message.Role == RoleDeveloper {
 			request.System = appendSystemText(request.System, joinTextParts(message.Parts))
 			previousWasTool = false
 			continue
 		}
-		request.Messages, previousWasTool = appendOpenAIInboundAnthropicMessage(request.Messages, message, previousWasTool)
+		request.Messages, previousWasTool = appendOpenAIInboundAnthropicMessage(request.Messages, message, previousWasTool, recorder, fmt.Sprintf("messages[%d]", i))
 	}
 
 	applyAnthropicCache(&request, req.Cache, opts.CacheControl)
+	if err := recorder.attachTo(req, opts.LossPolicy); err != nil {
+		return nil, err
+	}
 	return json.Marshal(request)
 }
 
