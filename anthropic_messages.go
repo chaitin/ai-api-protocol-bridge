@@ -508,7 +508,7 @@ func (e *anthropicStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent, erro
 		}
 		return singleAnthropicStreamEvent("error", anthropicStreamEvent{Type: "error", Error: anthropicError{Type: anthropicErrorType(part.Error), Message: message}})
 	case StreamRaw:
-		delta := anthropicStreamDelta{Type: "raw", Text: fmt.Sprint(part.RawValue)}
+		delta := anthropicStreamDelta{Type: "raw", Text: rawStreamText(part.RawValue)}
 		return singleAnthropicStreamEvent("raw", anthropicStreamEvent{Type: "raw", Delta: &delta})
 	default:
 		return nil, nil

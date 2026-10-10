@@ -1,0 +1,71 @@
+[
+  {
+    "data": {
+      "choices": [
+        {
+          "delta": {
+            "role": "assistant"
+          },
+          "finish_reason": null,
+          "index": 0
+        }
+      ],
+      "created": 0,
+      "id": "resp_1",
+      "model": "gpt-5.4",
+      "object": "chat.completion.chunk"
+    }
+  },
+  {
+    "data": {
+      "choices": [
+        {
+          "delta": {
+            "content": "README.md"
+          },
+          "finish_reason": null,
+          "index": 0
+        }
+      ],
+      "created": 0,
+      "id": "",
+      "model": "gpt-5.4",
+      "object": "chat.completion.chunk"
+    }
+  },
+  {
+    "data": {
+      "choices": [
+        {
+          "delta": {},
+          "finish_reason": "stop",
+          "index": 0
+        }
+      ],
+      "created": 0,
+      "id": "",
+      "model": "gpt-5.4",
+      "object": "chat.completion.chunk"
+    }
+  },
+  {
+    "data": {
+      "choices": [],
+      "created": 0,
+      "id": "resp_1",
+      "model": "gpt-5.4",
+      "object": "chat.completion.chunk",
+      "usage": {
+        "completion_tokens": 8,
+        "prompt_tokens": 1200,
+        "prompt_tokens_details": {
+          "cached_tokens": 1024
+        },
+        "total_tokens": 1208
+      }
+    }
+  },
+  {
+    "data": "[DONE]"
+  }
+]

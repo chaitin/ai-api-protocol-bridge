@@ -1,0 +1,93 @@
+[
+  {
+    "data": {
+      "response": {
+        "id": "chatcmpl-1",
+        "model": "gpt-5.4",
+        "object": "response",
+        "output": [],
+        "status": "in_progress"
+      },
+      "sequence_number": 0,
+      "type": "response.created"
+    },
+    "event": "response.created"
+  },
+  {
+    "data": {
+      "response": {
+        "id": "chatcmpl-1",
+        "model": "gpt-5.4",
+        "object": "response",
+        "output": [],
+        "status": "in_progress"
+      },
+      "sequence_number": 0,
+      "type": "response.in_progress"
+    },
+    "event": "response.in_progress"
+  },
+  {
+    "data": {
+      "item": {
+        "content": [
+          {
+            "type": "output_text"
+          }
+        ],
+        "id": "msg_1",
+        "role": "assistant",
+        "status": "in_progress",
+        "type": "message",
+        "usage": {}
+      },
+      "output_index": 0,
+      "sequence_number": 0,
+      "type": "response.output_item.added"
+    },
+    "event": "response.output_item.added"
+  },
+  {
+    "data": {
+      "content_index": 0,
+      "content_part": {
+        "type": "output_text"
+      },
+      "item_id": "msg_1",
+      "output_index": 0,
+      "sequence_number": 0,
+      "type": "response.content_part.added"
+    },
+    "event": "response.content_part.added"
+  },
+  {
+    "data": {
+      "content_index": 0,
+      "delta": "README.md",
+      "item_id": "msg_1",
+      "output_index": 0,
+      "sequence_number": 0,
+      "type": "response.output_text.delta"
+    },
+    "event": "response.output_text.delta"
+  },
+  {
+    "data": {
+      "response": {
+        "id": "chatcmpl-1",
+        "model": "gpt-5.4",
+        "object": "response",
+        "output": [],
+        "status": "completed",
+        "usage": {
+          "input_tokens": 1200,
+          "output_tokens": 8,
+          "total_tokens": 1208
+        }
+      },
+      "sequence_number": 0,
+      "type": "response.completed"
+    },
+    "event": "response.completed"
+  }
+]

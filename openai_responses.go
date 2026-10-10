@@ -2073,7 +2073,7 @@ func (e *openAIResponsesStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent
 	case StreamError:
 		return e.encodeStreamError(part)
 	case StreamRaw:
-		return e.singleOpenAIResponsesStreamEvent("raw", openAIResponsesStreamEvent{Type: "raw", Delta: fmt.Sprint(part.RawValue)})
+		return e.singleOpenAIResponsesStreamEvent("raw", openAIResponsesStreamEvent{Type: "raw", Delta: rawStreamText(part.RawValue)})
 	default:
 		return nil, nil
 	}

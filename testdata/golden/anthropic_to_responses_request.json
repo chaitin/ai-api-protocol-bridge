@@ -1,0 +1,56 @@
+{
+  "input": [
+    {
+      "content": [
+        {
+          "text": "List the files in the working directory.",
+          "type": "input_text"
+        }
+      ],
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "instructions": "You are a coding agent running in a sandbox.\u003cenv\u003e\nWorking directory: /workspace\nPlatform: linux\n\u003c/env\u003e",
+  "max_output_tokens": 32000,
+  "model": "upstream-model",
+  "stream": true,
+  "temperature": 1,
+  "tools": [
+    {
+      "description": "Run a shell command in the sandbox.",
+      "name": "Bash",
+      "parameters": {
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "timeout": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      },
+      "type": "function"
+    },
+    {
+      "description": "Read a file from disk.",
+      "name": "Read",
+      "parameters": {
+        "properties": {
+          "file_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "file_path"
+        ],
+        "type": "object"
+      },
+      "type": "function"
+    }
+  ]
+}

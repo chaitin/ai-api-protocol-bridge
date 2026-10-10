@@ -201,6 +201,10 @@ func (a OpenAIChatAdapter) NewStreamEncoder(opts StreamEncodeOptions) (StreamEnc
 }
 
 type openAIChatStreamChunk struct {
+	// Raw carries an upstream frame this package does not model. It is an
+	// extension field: a client that only reads choices ignores it.
+	Raw string `json:"protocol_bridge_raw,omitempty"`
+
 	ID      string                      `json:"id"`
 	Object  string                      `json:"object"`
 	Created int64                       `json:"created"`
@@ -267,7 +271,17 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 	parts := make([]StreamPart, 0)
 	if !d.started {
 		d.started = true
-		part := StreamPart{Type: StreamStart, ID: chunk.ID, ProviderMetadata: map[string]any{"model": chunk.Model}}
+		// The role is folded in rather than sent as a StreamStart of its own.
+		// OpenAI opens every stream with a chunk carrying both the model and the
+		// role, and emitting two start parts for it made every encoder publish
+		// its opening event twice — a Responses client saw response.created and
+		// response.in_progress repeated, and an Anthropic client would see
+		// message_start twice.
+		metadata := map[string]any{"model": chunk.Model}
+		if role := openAIChatStreamRole(chunk); role != "" {
+			metadata["role"] = role
+		}
+		part := StreamPart{Type: StreamStart, ID: chunk.ID, ProviderMetadata: metadata}
 		if chunk.Usage != nil {
 			part.Usage = decodeOpenAIUsage(openAIUsage{
 				PromptTokens:            chunk.Usage.PromptTokens,
@@ -283,9 +297,6 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 	for _, choice := range chunk.Choices {
 		if choice.Delta == nil {
 			continue
-		}
-		if choice.Delta.Role != "" {
-			parts = append(parts, StreamPart{Type: StreamStart, ID: chunk.ID, ProviderMetadata: map[string]any{"role": choice.Delta.Role}})
 		}
 		if choice.Delta.Reasoning != nil && *choice.Delta.Reasoning != "" {
 			parts = append(parts, StreamPart{Type: StreamReasoningDelta, ID: streamIndexID(choice.Index), Delta: *choice.Delta.Reasoning})
@@ -324,6 +335,17 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 	}
 
 	return parts, nil
+}
+
+// openAIChatStreamRole returns the role a chunk announces, if any. Only the
+// chunk that opens a stream normally carries one.
+func openAIChatStreamRole(chunk openAIChatStreamChunk) string {
+	for _, choice := range chunk.Choices {
+		if choice.Delta != nil && choice.Delta.Role != "" {
+			return choice.Delta.Role
+		}
+	}
+	return ""
 }
 
 func (d *openAIChatStreamDecoder) Close() ([]StreamPart, error) {
@@ -409,7 +431,18 @@ func (e *openAIChatStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent, err
 	case StreamError:
 		return e.encodeStreamError(part)
 	case StreamRaw:
-		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{Content: strPtr(fmt.Sprint(part.RawValue))}}}}
+		// An unmodelled upstream frame is not model output, and chat has no
+		// raw-event slot. Emitting it as content is what put Go syntax in the
+		// assistant's answer, so the frame rides in an extension field instead:
+		// a host logging the stream still sees it, and a client reading content
+		// does not.
+		chunk := openAIChatStreamChunk{
+			Object:  "chat.completion.chunk",
+			Model:   e.model,
+			Created: e.timestamp(),
+			Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{}}},
+			Raw:     rawStreamText(part.RawValue),
+		}
 		return singleOpenAIChatStreamEvent(chunk)
 	default:
 		return nil, nil

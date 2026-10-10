@@ -1,6 +1,9 @@
 package protocolbridge
 
-import "errors"
+import (
+	"encoding/json"
+	"errors"
+)
 
 // ErrStreamTruncated reports an upstream stream that ended without a terminal
 // event: the provider's connection dropped mid-generation, or it closed the
@@ -11,6 +14,31 @@ import "errors"
 // because the encoder synthesizes a normal finish for any stream that merely
 // stops.
 var ErrStreamTruncated = errors.New("protocolbridge: upstream stream ended without a terminal event")
+
+// rawStreamText renders a StreamRaw value for the wire.
+//
+// A raw value is either text a decoder could not parse, which is already JSON,
+// or the decoded event struct it did not model. Rendering the struct with
+// fmt.Sprint produced Go syntax — braces, field names, "<nil>" — and the chat
+// encoder put that in the assistant's content, so a client saw the package's
+// internals as the model's answer.
+func rawStreamText(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	case []byte:
+		return string(typed)
+	case json.RawMessage:
+		return string(typed)
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
 
 // truncatedStreamError is the StreamError value a decoder emits for an
 // upstream that ended early. The keys are the ones the error readers use, so
