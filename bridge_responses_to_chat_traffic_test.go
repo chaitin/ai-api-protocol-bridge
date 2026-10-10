@@ -136,9 +136,13 @@ func TestResponsesToChatBridgeRelaysCodexFirstTurn(t *testing.T) {
 		t.Fatalf("stream_options = %#v", decoded["stream_options"])
 	}
 
-	// Nothing was dropped on the first turn.
-	if len(req.Warnings) != 0 {
+	// No content was dropped on the first turn. The one report is the include
+	// request, which chat has no field for and which this fixture always sends.
+	if len(req.Warnings) != 1 {
 		t.Fatalf("warnings = %+v", req.Warnings)
+	}
+	if req.Warnings[0].Code != LossUnsupportedInclude || req.Warnings[0].Severity != SeverityInfo {
+		t.Fatalf("warning = %+v", req.Warnings[0])
 	}
 }
 
@@ -183,12 +187,17 @@ func TestResponsesToChatBridgeReplaysCodexToolResultTurn(t *testing.T) {
 		t.Fatalf("tool content = %v", tool["content"])
 	}
 
-	// The reasoning item has no chat-completions field. It is reported, at
-	// informational severity, because the answer does not depend on it.
-	if len(req.Warnings) != 1 {
+	// Two things the chat protocol cannot carry: the include request, which is
+	// how the Responses protocol asks for extra output, and the reasoning item.
+	// Both are reported, at informational severity, because the answer does not
+	// depend on either.
+	if len(req.Warnings) != 2 {
 		t.Fatalf("warnings = %+v", req.Warnings)
 	}
-	warning := req.Warnings[0]
+	if req.Warnings[0].Code != LossUnsupportedInclude || req.Warnings[0].Severity != SeverityInfo || req.Warnings[0].Path != "include[0]" {
+		t.Fatalf("include warning = %+v", req.Warnings[0])
+	}
+	warning := req.Warnings[1]
 	if warning.Code != LossDroppedReasoning || warning.Severity != SeverityInfo {
 		t.Fatalf("warning = %+v", warning)
 	}

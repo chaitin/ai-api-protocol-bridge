@@ -87,6 +87,7 @@ func (a AnthropicMessagesAdapter) EncodeRequest(req *LLMRequest, opts EncodeRequ
 		Metadata:      encodeAnthropicMetadata(req.Metadata),
 	}
 	recorder := newLossRecorder(req.Protocol, ProtocolAnthropicMessages)
+	reportUnsupportedInclude(recorder, req.Include, ProtocolAnthropicMessages)
 	reportUnsupportedAnthropicTools(recorder, req.Tools)
 
 	request.OutputConfig = encodeAnthropicOutputConfig(req.ResponseFormat)

@@ -34,6 +34,7 @@ func (b openAIResponsesToAnthropicBridge) EncodeUpstreamRequest(req *LLMRequest,
 		Stream:        req.Stream,
 	}
 	recorder := newLossRecorder(req.Protocol, ProtocolAnthropicMessages)
+	reportUnsupportedInclude(recorder, req.Include, ProtocolAnthropicMessages)
 	reportUnsupportedAnthropicTools(recorder, req.Tools)
 
 	request.OutputConfig = encodeAnthropicOutputConfig(req.ResponseFormat)

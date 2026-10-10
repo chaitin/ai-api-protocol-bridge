@@ -102,6 +102,7 @@ func (a OpenAIChatAdapter) EncodeRequest(req *LLMRequest, opts EncodeRequestOpti
 		Stream:              req.Stream,
 	}
 	recorder := newLossRecorder(req.Protocol, ProtocolOpenAIChat)
+	reportUnsupportedInclude(recorder, req.Include, ProtocolOpenAIChat)
 	for i, message := range req.Prompt {
 		encoded, err := encodeOpenAIChatMessages(message, recorder, fmt.Sprintf("messages[%d]", i))
 		if err != nil {

@@ -55,6 +55,11 @@ const (
 	// field for.
 	LossDroppedStopSequences = "dropped_stop_sequences"
 
+	// LossUnsupportedInclude is a request for extra output, made through the
+	// Responses protocol's include field, that the target protocol has no field
+	// to ask for. The request is served without it.
+	LossUnsupportedInclude = "unsupported_include"
+
 	// LossDroppedReasoning is reasoning content the target protocol has no
 	// field for. Losing an earlier turn's reasoning is usually harmless, so the
 	// chat encoder reports it at SeverityInfo.
@@ -181,6 +186,44 @@ func (r *lossRecorder) attachToResponse(resp *LLMResponse, policy LossPolicy) er
 	return rejectLosses(policy, r.warnings)
 }
 
+// protocolLabel names a protocol the way a diagnostic message should read. The
+// Protocol values are wire identifiers, and "openai_chat has no include field"
+// reads like an internal detail leaking into a note meant for a person.
+func protocolLabel(protocol Protocol) string {
+	switch protocol {
+	case ProtocolOpenAIChat:
+		return "chat completions"
+	case ProtocolOpenAIResponses:
+		return "the Responses API"
+	case ProtocolAnthropicMessages:
+		return "Anthropic Messages"
+	default:
+		return string(protocol)
+	}
+}
+
+// reportUnsupportedInclude records the include entries a target protocol has no
+// field to ask for.
+//
+// Only the Responses protocol has an include field, so this fires on the way to
+// chat and to Anthropic. The entries are reported at informational severity
+// rather than as warnings: include is how the Responses protocol asks for extra
+// output, and a coding agent sends reasoning.encrypted_content on essentially
+// every request, so treating that as a loss worth failing over would make
+// LossPolicyStrict unusable for the traffic this package exists to bridge. A host
+// that wants it to count for more can read the warnings and decide.
+func reportUnsupportedInclude(recorder *lossRecorder, include []string, to Protocol) {
+	for i, entry := range include {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		recorder.report(LossUnsupportedInclude, fmt.Sprintf("include[%d]", i),
+			fmt.Sprintf("%s has no include field, so %q was not requested", protocolLabel(to), entry),
+			SeverityInfo)
+	}
+}
+
 // reportDroppedChoices records the completions a target protocol cannot carry.
 //
 // Anthropic Messages and OpenAI Responses each describe a single assistant
@@ -192,7 +235,7 @@ func reportDroppedChoices(recorder *lossRecorder, resp *LLMResponse, to Protocol
 		return
 	}
 	recorder.report(LossDroppedChoice, "choices",
-		fmt.Sprintf("%s carries one completion, so %d of the %d choices were dropped", to, len(resp.Choices)-1, len(resp.Choices)),
+		fmt.Sprintf("%s carries one completion, so %d of the %d choices were dropped", protocolLabel(to), len(resp.Choices)-1, len(resp.Choices)),
 		SeverityWarning)
 }
 
