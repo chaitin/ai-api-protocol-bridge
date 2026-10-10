@@ -285,6 +285,17 @@ const (
 	FinishUnknown       FinishReason = "unknown"
 )
 
+// Usage is token accounting in the reporting protocol's own terms, and the
+// terms differ.
+//
+// For the two OpenAI protocols InputTokens is the prompt total, with the cached
+// portion broken out in CachedInputTokens. For Anthropic InputTokens excludes
+// what was served from cache, and the cached count is in CacheReadInputTokens.
+// Nothing in this struct says which reading applies, because it cannot: to turn
+// these numbers into a bill, use LLMResponse.BillingUsage or
+// billingUsageForProtocol with the protocol the numbers came from. Reading the
+// fields directly and treating them as one definition is how a cached prompt
+// gets counted twice or not at all.
 type Usage struct {
 	InputTokens              *int `json:"input_tokens,omitempty"`
 	OutputTokens             *int `json:"output_tokens,omitempty"`
@@ -294,28 +305,39 @@ type Usage struct {
 	CacheReadInputTokens     *int `json:"cache_read_input_tokens,omitempty"`
 }
 
+// mergeUsage folds a later usage report into an accumulator.
+//
+// A field the update omits keeps its previous value, and so does a field the
+// update reports as zero. Providers differ on whether a count they are not
+// restating is omitted or sent as 0, and for Anthropic that difference is
+// expensive: message_start reports input_tokens once, and a message_delta that
+// repeats it as 0 would otherwise erase the prompt count and leave the host
+// billing nothing for it.
+//
+// The trade-off is that a count cannot be corrected downwards to zero
+// mid-stream. No provider is known to need that, and the final report of a
+// stream is authoritative anyway.
 func mergeUsage(base *Usage, update Usage) {
 	if base == nil {
 		return
 	}
-	if update.InputTokens != nil {
-		base.InputTokens = update.InputTokens
+	mergeUsageCount(&base.InputTokens, update.InputTokens)
+	mergeUsageCount(&base.OutputTokens, update.OutputTokens)
+	mergeUsageCount(&base.ReasoningTokens, update.ReasoningTokens)
+	mergeUsageCount(&base.CachedInputTokens, update.CachedInputTokens)
+	mergeUsageCount(&base.CacheCreationInputTokens, update.CacheCreationInputTokens)
+	mergeUsageCount(&base.CacheReadInputTokens, update.CacheReadInputTokens)
+}
+
+// mergeUsageCount records update unless it is a zero restating nothing.
+func mergeUsageCount(target **int, update *int) {
+	if update == nil {
+		return
 	}
-	if update.OutputTokens != nil {
-		base.OutputTokens = update.OutputTokens
+	if *update == 0 && *target != nil && **target != 0 {
+		return
 	}
-	if update.ReasoningTokens != nil {
-		base.ReasoningTokens = update.ReasoningTokens
-	}
-	if update.CachedInputTokens != nil {
-		base.CachedInputTokens = update.CachedInputTokens
-	}
-	if update.CacheCreationInputTokens != nil {
-		base.CacheCreationInputTokens = update.CacheCreationInputTokens
-	}
-	if update.CacheReadInputTokens != nil {
-		base.CacheReadInputTokens = update.CacheReadInputTokens
-	}
+	*target = update
 }
 
 func hasUsage(usage Usage) bool {
