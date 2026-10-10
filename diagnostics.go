@@ -181,6 +181,21 @@ func (r *lossRecorder) attachToResponse(resp *LLMResponse, policy LossPolicy) er
 	return rejectLosses(policy, r.warnings)
 }
 
+// reportDroppedChoices records the completions a target protocol cannot carry.
+//
+// Anthropic Messages and OpenAI Responses each describe a single assistant
+// turn, so a chat upstream that was asked for several completions has all but
+// the first dropped. The caller asked for them and paid for them, so silence
+// here is a real loss rather than a formatting detail.
+func reportDroppedChoices(recorder *lossRecorder, resp *LLMResponse, to Protocol) {
+	if resp == nil || len(resp.Choices) <= 1 {
+		return
+	}
+	recorder.report(LossDroppedChoice, "choices",
+		fmt.Sprintf("%s carries one completion, so %d of the %d choices were dropped", to, len(resp.Choices)-1, len(resp.Choices)),
+		SeverityWarning)
+}
+
 // rejectLosses returns a *ConversionError when the policy refuses any of the
 // reported losses.
 func rejectLosses(policy LossPolicy, warnings []Warning) error {

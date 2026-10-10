@@ -35,9 +35,10 @@ AI API Protocol Bridge 是一个 Go 协议转换包，用来在 OpenAI 和 Anthr
 | OpenAI Responses | Anthropic Messages | |
 | Anthropic Messages | OpenAI Chat Completions | |
 | Anthropic Messages | OpenAI Responses | |
-| OpenAI Chat Completions | OpenAI Responses | 尚未支持 |
+| OpenAI Chat Completions | OpenAI Responses | |
 
-同一家族内的协议对（如 Chat → Responses、Chat → Chat）返回 `false`。
+六个跨协议方向全部可用；只有完全相同的协议对（如 Chat → Chat）返回 `false`，
+因为它不需要转换。`bridge_matrix_test.go` 会遍历并钉住每一个方向。
 
 `NewCrossFamilyBridge(inbound, upstreamFamily)` 是按**家族**取桥的旧接口，仍然可用，
 但家族不足以定位目标：Anthropic 入口有两个 OpenAI 目标，家族查询一律返回
@@ -249,12 +250,38 @@ _ = adapter
 provider metadata 和 warnings。`BillingUsage()` 会按协议差异归一化可计费的
 输入、缓存输入和输出 token。
 
+## 转换损耗
+
+两个协议之间不可能什么都表达得下。丢东西的时候本包不会沉默，也不会把它伪装成
+prompt 的一部分：
+
+- 每个解码器/编码器把遇到的损耗记录到 `LLMRequest.Warnings`（入口方向）或
+  `LLMResponse.Warnings`（出口方向）。每条 `Warning` 带 `Code`、`Severity`、
+  `Path`（如 `messages[3].content[1]`）以及转换方向 `From`/`To`。
+- `EncodeRequestOptions.LossPolicy` / `EncodeResponseOptions.LossPolicy` 决定什么
+  不可接受：`Allow`（零值，记录后继续）、`Safe`（额外拒绝会改变模型行为的损耗，
+  即 `SeverityError`）、`Strict`（拒绝任何丢了内容的损耗，即 severity 高于
+  `SeverityInfo`）。被拒绝时返回 `*ConversionError`，逐条列出损耗，同时损耗仍
+  写在对象上。
+
+已经上报的损耗包括：Chat `file` 部件承载不了的文档、Anthropic 无法解析的文件 id
+或媒体类型、目标协议没有对应物的工具、Responses API 没有的 stop sequences 字段、
+只有单一 assistant 轮的协议承载不了的多候选，以及 chat completions 没有的
+reasoning 字段。
+
+不会做的事：把警告文本写进 system prompt 或对话内容。那会改变模型看到的字节、让
+prompt cache 前缀每轮失效，而且模型会以为那是用户说的话。
+
 ## 兼容性说明
 
-- 跨协议请求会尽量保留双方都能表达的语义；目标协议不支持的字段可能被忽略、
-  降级为 warning 文本，或在编码阶段返回错误。
-- OpenAI Responses 上游编码不支持 `StopSequences`，传入后会返回错误。
+- 跨协议请求会尽量保留双方都能表达的语义；目标协议表达不了的字段会被记录下来，
+  见上文「转换损耗」。
+- OpenAI Responses 没有 stop sequences 字段，因此传入的 `StopSequences` 会被记录
+  为损耗；默认继续，`LossPolicySafe`/`Strict` 下会失败。
 - OpenAI 与 Anthropic 的 cache / usage 口径不同，跨协议响应会做必要的用量映射。
+  `Usage` 的同一个字段在两种口径下含义不同，只有配合协议才有意义；换算用
+  `BillingUsage()`。
+- 流式上游中途断流（没有终止事件）会产生 `StreamError`，而不是看起来正常的短回答。
 - Anthropic thinking 与强制工具选择存在协议限制，必要时会将工具选择降级为
   `auto`。
 - Provider-specific 字段不会被当作完整透传能力；调用方应只依赖统一模型和目标
@@ -278,6 +305,9 @@ provider metadata 和 warnings。`BillingUsage()` 会按协议差异归一化可
 
 ```bash
 go test ./...
+
+# 有意改动线上格式后，重写 golden 快照并阅读 diff
+go test ./... -update
 ```
 
 查看公开 API 时，可以从 [adapter.go](./adapter.go)、[types.go](./types.go) 和

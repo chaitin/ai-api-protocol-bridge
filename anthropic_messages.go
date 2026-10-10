@@ -166,8 +166,10 @@ func (a AnthropicMessagesAdapter) EncodeResponse(resp *LLMResponse, opts EncodeR
 		model = opts.Model
 	}
 
-	content, finishReason := firstResponseContent(resp)
 	recorder := newLossRecorder(resp.Protocol, ProtocolAnthropicMessages)
+	reportDroppedChoices(recorder, resp, ProtocolAnthropicMessages)
+
+	content, finishReason := firstResponseContent(resp)
 	response := anthropicResponse{
 		ID:         resp.ID,
 		Type:       "message",

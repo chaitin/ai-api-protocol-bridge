@@ -214,6 +214,9 @@ func (a OpenAIResponsesAdapter) EncodeResponse(resp *LLMResponse, opts EncodeRes
 		model = opts.Model
 	}
 
+	recorder := newLossRecorder(resp.Protocol, ProtocolOpenAIResponses)
+	reportDroppedChoices(recorder, resp, ProtocolOpenAIResponses)
+
 	content, finishReason := firstResponseContent(resp)
 	response := openAIResponsesResponse{
 		ID:         resp.ID,
@@ -232,6 +235,9 @@ func (a OpenAIResponsesAdapter) EncodeResponse(resp *LLMResponse, opts EncodeRes
 	response.Output = append(response.Output, encodeOpenAIResponsesResponseToolCalls(content, finishReason)...)
 	response.Output = append(response.Output, encodeOpenAIResponsesResponseToolResults(content, finishReason)...)
 
+	if err := recorder.attachToResponse(resp, opts.LossPolicy); err != nil {
+		return nil, err
+	}
 	return json.Marshal(response)
 }
 

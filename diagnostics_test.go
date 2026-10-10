@@ -128,6 +128,68 @@ func TestLossPolicyLevels(t *testing.T) {
 	}
 }
 
+// Anthropic Messages and OpenAI Responses each describe one assistant turn. A
+// chat upstream asked for several completions has all but the first dropped, and
+// the caller paid for them, so the loss is reported rather than absorbed.
+func TestDroppedChoicesAreReported(t *testing.T) {
+	chatResponse := []byte(`{
+	  "id": "chatcmpl-1",
+	  "object": "chat.completion",
+	  "created": 1,
+	  "model": "gpt-4o",
+	  "choices": [
+	    {"index": 0, "message": {"role": "assistant", "content": "first"}, "finish_reason": "stop"},
+	    {"index": 1, "message": {"role": "assistant", "content": "second"}, "finish_reason": "stop"}
+	  ],
+	  "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}
+	}`)
+
+	cases := []struct {
+		name    string
+		adapter Adapter
+	}{
+		{"anthropic messages", NewAnthropicMessagesAdapter()},
+		{"openai responses", NewOpenAIResponsesAdapter()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := NewOpenAIChatAdapter().DecodeResponse(chatResponse)
+			if err != nil {
+				t.Fatalf("DecodeResponse() error = %v", err)
+			}
+			resp.Protocol = ProtocolOpenAIChat
+			if _, err := tc.adapter.EncodeResponse(resp, EncodeResponseOptions{}); err != nil {
+				t.Fatalf("EncodeResponse() error = %v", err)
+			}
+			if len(resp.Warnings) != 1 {
+				t.Fatalf("warnings = %+v", resp.Warnings)
+			}
+			warning := resp.Warnings[0]
+			if warning.Code != LossDroppedChoice || warning.Severity != SeverityWarning {
+				t.Fatalf("warning = %+v", warning)
+			}
+			if warning.Path != "choices" || !strings.Contains(warning.Message, "1 of the 2") {
+				t.Fatalf("warning = %+v", warning)
+			}
+			if warning.From != ProtocolOpenAIChat {
+				t.Fatalf("warning from = %q", warning.From)
+			}
+		})
+	}
+
+	// A single choice is not a loss.
+	resp, err := NewOpenAIChatAdapter().DecodeResponse([]byte(`{"id":"c","choices":[{"index":0,"message":{"role":"assistant","content":"only"},"finish_reason":"stop"}]}`))
+	if err != nil {
+		t.Fatalf("DecodeResponse() error = %v", err)
+	}
+	if _, err := NewAnthropicMessagesAdapter().EncodeResponse(resp, EncodeResponseOptions{}); err != nil {
+		t.Fatalf("EncodeResponse() error = %v", err)
+	}
+	if len(resp.Warnings) != 0 {
+		t.Fatalf("warnings = %+v, want none for a single choice", resp.Warnings)
+	}
+}
+
 // A lost file must never be replaced by text the model reads as conversation.
 // This guard fails if a converter reintroduces that, because the text changes
 // the request bytes and invalidates the cached prompt prefix on every turn.
