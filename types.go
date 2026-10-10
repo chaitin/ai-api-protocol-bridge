@@ -54,6 +54,14 @@ type LLMRequest struct {
 
 	Metadata map[string]string `json:"metadata,omitempty"`
 
+	// ProviderOptions is not read by any converter and is not forwarded to the
+	// upstream. It carried no behaviour when this was written, and setting it is
+	// a silent no-op: nothing in the package reads it, and a test pins that
+	// setting it leaves the encoded request byte-identical.
+	//
+	// Deprecated: it will be removed in the next major version. A caller that
+	// needs a provider-specific field should pass it through its own layer rather
+	// than expect this package to relay it.
 	ProviderOptions map[string]any `json:"provider_options,omitempty"`
 
 	// Warnings collects what decoding the inbound request, and then encoding it
@@ -67,6 +75,14 @@ type Message struct {
 
 	Parts []Part `json:"parts,omitempty"`
 
+	// ProviderOptions is not read by any converter and is not forwarded to the
+	// upstream. It carried no behaviour when this was written, and setting it is
+	// a silent no-op: nothing in the package reads it, and a test pins that
+	// setting it leaves the encoded request byte-identical.
+	//
+	// Deprecated: it will be removed in the next major version. A caller that
+	// needs a provider-specific field should pass it through its own layer rather
+	// than expect this package to relay it.
 	ProviderOptions map[string]any `json:"provider_options,omitempty"`
 }
 
@@ -90,6 +106,14 @@ type Part struct {
 	ToolCall   *ToolCallPart   `json:"tool_call,omitempty"`
 	ToolResult *ToolResultPart `json:"tool_result,omitempty"`
 
+	// ProviderOptions is not read by any converter and is not forwarded to the
+	// upstream. It carried no behaviour when this was written, and setting it is
+	// a silent no-op: nothing in the package reads it, and a test pins that
+	// setting it leaves the encoded request byte-identical.
+	//
+	// Deprecated: it will be removed in the next major version. A caller that
+	// needs a provider-specific field should pass it through its own layer rather
+	// than expect this package to relay it.
 	ProviderOptions map[string]any `json:"provider_options,omitempty"`
 }
 
@@ -178,6 +202,14 @@ type Tool struct {
 	Strict      *bool          `json:"strict,omitempty"`
 	Config      map[string]any `json:"config,omitempty"`
 
+	// ProviderOptions is not read by any converter and is not forwarded to the
+	// upstream. It carried no behaviour when this was written, and setting it is
+	// a silent no-op: nothing in the package reads it, and a test pins that
+	// setting it leaves the encoded request byte-identical.
+	//
+	// Deprecated: it will be removed in the next major version. A caller that
+	// needs a provider-specific field should pass it through its own layer rather
+	// than expect this package to relay it.
 	ProviderOptions map[string]any `json:"provider_options,omitempty"`
 }
 

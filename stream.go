@@ -74,6 +74,12 @@ type StreamPart struct {
 
 	Usage Usage `json:"usage,omitempty"`
 
+	// Warnings lists what this part lost. No decoder in this package populates
+	// it: a mid-stream loss has nowhere to go, because the only thing a
+	// StreamEncoder can hand back is wire frames, and the client protocols have
+	// no field for it. A stream that ends badly is reported as a StreamError
+	// instead. The field is kept so a decoder can start reporting, but reading it
+	// today always yields nil.
 	Warnings []Warning `json:"warnings,omitempty"`
 
 	Error any `json:"error,omitempty"`

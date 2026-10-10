@@ -10,6 +10,11 @@ import (
 	"time"
 )
 
+// ErrStreamUnsupported is never returned. Every adapter in this package
+// implements streaming, so nothing constructs this error and no caller can
+// receive it.
+//
+// Deprecated: it will be removed in the next major version.
 var ErrStreamUnsupported = errors.New("protocolbridge: stream conversion is not implemented")
 
 type OpenAIChatAdapter struct{}
