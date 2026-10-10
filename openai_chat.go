@@ -34,6 +34,8 @@ func (a OpenAIChatAdapter) DecodeRequest(raw []byte) (*LLMRequest, error) {
 	}
 	maxOutputTokens = maxOutputTokensOrDefault(maxOutputTokens)
 
+	reasoning, reasoningEffort := decodeChatReasoningEffort(request.ReasoningEffort)
+
 	llmRequest := &LLMRequest{
 		Protocol:          ProtocolOpenAIChat,
 		Model:             request.Model,
@@ -47,7 +49,8 @@ func (a OpenAIChatAdapter) DecodeRequest(raw []byte) (*LLMRequest, error) {
 		Seed:              request.Seed,
 		CandidateCount:    request.N,
 		ResponseFormat:    decodeOpenAIResponseFormat(asRawMessage(request.ResponseFormat)),
-		Reasoning:         decodeReasoningEffort(request.ReasoningEffort),
+		Reasoning:         reasoning,
+		ReasoningEffort:   reasoningEffort,
 		Tools:             decodeOpenAITools(request.Tools),
 		ToolChoice:        decodeOpenAIToolChoice(asRawMessage(request.ToolChoice)),
 		ParallelToolCalls: request.ParallelToolCalls,
@@ -86,7 +89,7 @@ func (a OpenAIChatAdapter) EncodeRequest(req *LLMRequest, opts EncodeRequestOpti
 		Seed:                req.Seed,
 		N:                   req.CandidateCount,
 		ResponseFormat:      encodeOpenAIResponseFormat(req.ResponseFormat),
-		ReasoningEffort:     encodeReasoningEffort(req.Reasoning),
+		ReasoningEffort:     encodeOpenAIChatReasoningEffort(req),
 		StreamOptions:       encodeOpenAIStreamOptions(req.Stream),
 		Tools:               encodeOpenAITools(req.Tools),
 		ToolChoice:          encodeOpenAIToolChoice(req.ToolChoice),
@@ -652,19 +655,70 @@ func decodeOpenAIChatMessage(message openAIChatMessage) (Message, error) {
 	return decoded, nil
 }
 
-func decodeReasoningEffort(effort string) *bool {
-	if strings.TrimSpace(effort) == "" {
-		return nil
+// decodeChatReasoningEffort returns the unified enabled flag and the level word
+// for a chat reasoning_effort.
+//
+// The level used to be discarded here: any non-empty value became a bare
+// "enabled". That is why reasoning_effort "high" reached an Anthropic upstream
+// as the 1024-token minimum thinking budget — the level never left the adapter.
+// The level is the richer signal, so it is carried on the request and every
+// encoder prefers it over the flag.
+func decodeChatReasoningEffort(effort string) (*bool, string) {
+	level := normalizeReasoningEffort(effort)
+	if level == "" {
+		return nil, ""
 	}
-	enabled := true
-	return &enabled
+	enabled := level != "none"
+	return &enabled, level
 }
 
-func encodeReasoningEffort(reasoning *bool) string {
-	if reasoning == nil || !*reasoning {
+// normalizeReasoningEffort lowercases a level and folds in the words that mean
+// the same thing. It deliberately keeps a level it does not recognise: narrowing
+// the vocabulary is the encoder's job, and decoding is where the caller's word
+// should survive so an upstream that understands it still receives it.
+func normalizeReasoningEffort(effort string) string {
+	level := strings.ToLower(strings.TrimSpace(effort))
+	switch level {
+	case "disabled", "off":
+		return "none"
+	}
+	return level
+}
+
+// normalizeChatReasoningEffort narrows a level to the words chat documents —
+// minimal, low, medium and high. A level above high becomes high rather than
+// being sent as a word a chat endpoint may reject; Responses, which does accept
+// the higher levels, keeps them.
+func normalizeChatReasoningEffort(effort string) string {
+	switch level := normalizeReasoningEffort(effort); level {
+	case "xhigh", "max":
+		return "high"
+	default:
+		return level
+	}
+}
+
+// encodeOpenAIChatReasoningEffort picks the level to send, preferring the richest
+// signal the unified request carries.
+func encodeOpenAIChatReasoningEffort(req *LLMRequest) string {
+	if req == nil {
 		return ""
 	}
-	return "medium"
+	if level := normalizeChatReasoningEffort(req.ReasoningEffort); level != "" {
+		if level == "none" {
+			// Chat has no word for "off"; omitting the field is how a request
+			// declines reasoning.
+			return ""
+		}
+		return level
+	}
+	if req.ReasoningBudgetTokens != nil {
+		return normalizeChatReasoningEffort(mapReasoningBudgetToOpenAIEffort(*req.ReasoningBudgetTokens))
+	}
+	if req.Reasoning != nil && *req.Reasoning {
+		return "medium"
+	}
+	return ""
 }
 
 func encodeOpenAIStreamOptions(stream bool) any {

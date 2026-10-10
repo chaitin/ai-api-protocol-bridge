@@ -364,7 +364,11 @@ func TestAnthropicMessagesThinkingBudgetOverride(t *testing.T) {
 	}
 }
 
-func TestAnthropicMessagesDecodeAdaptiveThinkingIgnoresOutputEffort(t *testing.T) {
+// thinking.type is what decides whether reasoning is on; output_config.effort is
+// not a second switch. "adaptive" is Anthropic's mode where the model picks how
+// much to think, so it is reasoning on, and reading it as off dropped thinking
+// from a request that asked for it.
+func TestAnthropicMessagesDecodeAdaptiveThinkingEnablesReasoning(t *testing.T) {
 	adapter := NewAnthropicMessagesAdapter()
 	req, err := adapter.DecodeRequest([]byte(`{
 		"model":"claude",
@@ -380,8 +384,8 @@ func TestAnthropicMessagesDecodeAdaptiveThinkingIgnoresOutputEffort(t *testing.T
 	if req.ReasoningEffort != "high" {
 		t.Fatalf("ReasoningEffort = %q, want high", req.ReasoningEffort)
 	}
-	if req.Reasoning != nil && *req.Reasoning {
-		t.Fatalf("Reasoning = %v, want not enabled by bool", req.Reasoning)
+	if req.Reasoning == nil || !*req.Reasoning {
+		t.Fatalf("Reasoning = %v, want enabled", req.Reasoning)
 	}
 	if req.Metadata["user_id"] != "session-1" {
 		t.Fatalf("Metadata = %+v", req.Metadata)
@@ -1025,9 +1029,11 @@ func TestReasoningConvertsAcrossProtocols(t *testing.T) {
 	if err := json.Unmarshal(anthropicRaw, &anthropicDecoded); err != nil {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
+	// 2048 is what the level "medium" maps to. This used to be the 1024 floor for
+	// every level, because the chat adapter dropped the level on decode.
 	thinking := anthropicDecoded["thinking"].(map[string]any)
-	if thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(defaultThinkingBudgetTokens) {
-		t.Fatalf("anthropic thinking = %+v", thinking)
+	if thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(2048) {
+		t.Fatalf("anthropic thinking = %+v, want the medium budget", thinking)
 	}
 
 	anthropicReq, err := NewAnthropicMessagesAdapter().DecodeRequest([]byte(`{

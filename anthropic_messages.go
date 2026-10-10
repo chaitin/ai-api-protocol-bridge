@@ -86,12 +86,12 @@ func (a AnthropicMessagesAdapter) EncodeRequest(req *LLMRequest, opts EncodeRequ
 		Stream:        req.Stream,
 		Metadata:      encodeAnthropicMetadata(req.Metadata),
 	}
-	request.OutputConfig = encodeAnthropicOutputConfig(req.ResponseFormat)
-	request.Thinking = encodeAnthropicThinking(req.Reasoning, req.ReasoningBudgetTokens, request.MaxTokens)
-	request.ToolChoice = encodeAnthropicToolChoice(sanitizeAnthropicToolChoice(req.ToolChoice, request.Thinking), req.ParallelToolCalls)
-
 	recorder := newLossRecorder(req.Protocol, ProtocolAnthropicMessages)
 	reportUnsupportedAnthropicTools(recorder, req.Tools)
+
+	request.OutputConfig = encodeAnthropicOutputConfig(req.ResponseFormat)
+	request.Thinking = encodeAnthropicThinking(req.Reasoning, req.ReasoningEffort, req.ReasoningBudgetTokens, request.MaxTokens, recorder)
+	request.ToolChoice = encodeAnthropicToolChoice(sanitizeAnthropicToolChoice(req.ToolChoice, request.Thinking), req.ParallelToolCalls)
 
 	for i, message := range req.Prompt {
 		if message.Role == RoleSystem || message.Role == RoleDeveloper {
@@ -856,7 +856,10 @@ func decodeAnthropicThinking(raw any) *bool {
 	if err := json.Unmarshal(asRawMessage(raw), &thinking); err != nil {
 		return nil
 	}
-	enabled := thinking.Type == "enabled"
+	// "adaptive" is Anthropic's mode where the model decides how much to think.
+	// Reading it as disabled dropped thinking from a request that asked for it,
+	// and the separate level decode already reports it as high.
+	enabled := thinking.Type == "enabled" || thinking.Type == "adaptive"
 	return &enabled
 }
 
@@ -894,15 +897,85 @@ func decodeAnthropicReasoningEffort(thinking any) string {
 	}
 }
 
-func encodeAnthropicThinking(reasoning *bool, budgetTokens *int, maxTokens *int) any {
-	if reasoning == nil || !*reasoning {
+// reasoningBudgetForEffort maps an OpenAI reasoning level onto an Anthropic
+// thinking budget.
+//
+// Anthropic's floor is 1024 tokens, so minimal and low both land on it and read
+// back as medium. The level itself stays on the unified request, so a caller that
+// needs the exact word reads that instead of round-tripping a budget.
+func reasoningBudgetForEffort(effort string) (int, bool) {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "minimal", "low":
+		return minAnthropicThinkingBudgetTokens, true
+	case "medium":
+		return 2048, true
+	case "high":
+		return 4096, true
+	case "xhigh", "max":
+		return 8192, true
+	default:
+		return 0, false
+	}
+}
+
+// encodeAnthropicThinking builds the thinking field, or nil when thinking is off.
+//
+// The budget comes from an explicit budget first, then from the reasoning level,
+// and only then from the bare enabled flag. Anthropic requires the budget to
+// leave room under max_tokens, so a budget derived from a level is clamped into
+// the room available — asking for "high" must not quietly turn thinking off —
+// while an explicit budget is the caller's own number and is reported rather than
+// rewritten.
+func encodeAnthropicThinking(reasoning *bool, effort string, budgetTokens *int, maxTokens *int, recorder *lossRecorder) any {
+	if reasoning != nil && !*reasoning {
 		return nil
 	}
-	budget := anthropicThinkingBudgetTokens(budgetTokens, maxTokens)
+	if strings.EqualFold(strings.TrimSpace(effort), "none") {
+		return nil
+	}
+
+	budget := budgetTokens
+	derived := false
 	if budget == nil {
+		if mapped, ok := reasoningBudgetForEffort(effort); ok {
+			budget = &mapped
+			derived = true
+		}
+	}
+	if budget == nil && (reasoning == nil || !*reasoning) {
 		return nil
 	}
-	return map[string]any{"type": "enabled", "budget_tokens": budget}
+
+	limit := defaultMaxOutputTokens
+	if maxTokens != nil && *maxTokens > 0 {
+		limit = *maxTokens
+	}
+
+	resolved := defaultThinkingBudgetTokens
+	if budget != nil {
+		resolved = *budget
+	}
+
+	if resolved >= limit {
+		if !derived {
+			if recorder != nil {
+				recorder.report(LossDroppedReasoning, "thinking",
+					fmt.Sprintf("thinking budget %d does not leave room under max_tokens %d, so thinking was not requested", resolved, limit),
+					SeverityWarning)
+			}
+			return nil
+		}
+		resolved = limit - 1
+	}
+	if resolved < minAnthropicThinkingBudgetTokens {
+		if recorder != nil {
+			recorder.report(LossDroppedReasoning, "thinking",
+				fmt.Sprintf("max_tokens %d leaves no room for the %d token minimum thinking budget, so thinking was not requested", limit, minAnthropicThinkingBudgetTokens),
+				SeverityWarning)
+		}
+		return nil
+	}
+	return map[string]any{"type": "enabled", "budget_tokens": resolved}
 }
 
 func decodeAnthropicCache(request anthropicRequest) *bool {
@@ -1026,21 +1099,6 @@ func encodeAnthropicOutputConfig(format *ResponseFormat) *anthropicOutputConfig 
 		return nil
 	}
 	return &anthropicOutputConfig{Format: &anthropicOutputFormat{Type: "json_schema", Schema: format.Schema, Strict: format.Strict}}
-}
-
-func anthropicThinkingBudgetTokens(budgetTokens *int, maxTokens *int) *int {
-	maxOutputTokens := defaultMaxOutputTokens
-	if maxTokens != nil && *maxTokens > 0 {
-		maxOutputTokens = *maxTokens
-	}
-	budget := defaultThinkingBudgetTokens
-	if budgetTokens != nil {
-		budget = *budgetTokens
-	}
-	if budget < minAnthropicThinkingBudgetTokens || budget >= maxOutputTokens {
-		return nil
-	}
-	return &budget
 }
 
 func encodeToolResultText(output ToolResultOutput) string {

@@ -33,12 +33,12 @@ func (b openAIChatToAnthropicBridge) EncodeUpstreamRequest(req *LLMRequest, opts
 		Tools:         encodeAnthropicTools(req.Tools),
 		Stream:        req.Stream,
 	}
-	request.OutputConfig = encodeAnthropicOutputConfig(req.ResponseFormat)
-	request.Thinking = encodeAnthropicThinkingForOpenAIInbound(req, request.MaxTokens)
-	request.ToolChoice = encodeAnthropicToolChoice(sanitizeAnthropicToolChoice(req.ToolChoice, request.Thinking), req.ParallelToolCalls)
-
 	recorder := newLossRecorder(req.Protocol, ProtocolAnthropicMessages)
 	reportUnsupportedAnthropicTools(recorder, req.Tools)
+
+	request.OutputConfig = encodeAnthropicOutputConfig(req.ResponseFormat)
+	request.Thinking = encodeAnthropicThinkingForOpenAIInbound(req, request.MaxTokens, recorder)
+	request.ToolChoice = encodeAnthropicToolChoice(sanitizeAnthropicToolChoice(req.ToolChoice, request.Thinking), req.ParallelToolCalls)
 
 	previousWasTool := false
 	for i, message := range req.Prompt {

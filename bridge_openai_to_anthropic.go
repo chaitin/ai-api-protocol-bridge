@@ -2,11 +2,11 @@ package protocolbridge
 
 import "strings"
 
-func encodeAnthropicThinkingForOpenAIInbound(req *LLMRequest, maxTokens *int) any {
+func encodeAnthropicThinkingForOpenAIInbound(req *LLMRequest, maxTokens *int, recorder *lossRecorder) any {
 	if req == nil {
 		return nil
 	}
-	thinking := encodeAnthropicThinking(req.Reasoning, req.ReasoningBudgetTokens, maxTokens)
+	thinking := encodeAnthropicThinking(req.Reasoning, req.ReasoningEffort, req.ReasoningBudgetTokens, maxTokens, recorder)
 	if thinking == nil {
 		return nil
 	}

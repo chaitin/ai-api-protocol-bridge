@@ -23,7 +23,7 @@
     }
   ],
   "thinking": {
-    "budget_tokens": 1024,
+    "budget_tokens": 2048,
     "type": "enabled"
   },
   "tool_choice": {
