@@ -62,8 +62,13 @@ func (a OpenAIResponsesAdapter) EncodeRequest(req *LLMRequest, opts EncodeReques
 	if req == nil {
 		return nil, errors.New("encode openai responses request: nil request")
 	}
+	recorder := newLossRecorder(req.Protocol, ProtocolOpenAIResponses)
 	if len(req.StopSequences) > 0 {
-		return nil, errors.New("encode openai responses request: stop sequences are not supported")
+		// The Responses API has no stop field, so there is nowhere to put
+		// these. Report it and let LossPolicy decide whether it is fatal.
+		recorder.report(LossDroppedStopSequences, "stop_sequences",
+			fmt.Sprintf("the Responses API has no stop field, so stop sequences %v were dropped and the model may generate past them", req.StopSequences),
+			SeverityWarning)
 	}
 
 	model := req.Model
@@ -95,16 +100,25 @@ func (a OpenAIResponsesAdapter) EncodeRequest(req *LLMRequest, opts EncodeReques
 			input = append(input, encodeOpenAIResponsesToolResults(message.Parts)...)
 			continue
 		}
-		input = append(input, openAIResponsesInputItem{
-			Role:    string(message.Role),
-			Content: encodeOpenAIResponsesInputContent(message.Role, message.Parts),
-		})
+		// An assistant turn that only called tools has no content to send, and
+		// an empty message item is not nothing: it asks the upstream to read a
+		// blank assistant turn. The call items below carry the turn on their
+		// own.
+		if content := encodeOpenAIResponsesInputContent(message.Role, message.Parts); len(content) > 0 {
+			input = append(input, openAIResponsesInputItem{
+				Role:    string(message.Role),
+				Content: content,
+			})
+		}
 		if message.Role == RoleAssistant {
 			input = append(input, encodeOpenAIResponsesToolCalls(message.Parts)...)
 		}
 	}
 	request.Input = input
 
+	if err := recorder.attachTo(req, opts.LossPolicy); err != nil {
+		return nil, err
+	}
 	return json.Marshal(request)
 }
 
@@ -200,6 +214,9 @@ func (a OpenAIResponsesAdapter) EncodeResponse(resp *LLMResponse, opts EncodeRes
 		model = opts.Model
 	}
 
+	recorder := newLossRecorder(resp.Protocol, ProtocolOpenAIResponses)
+	reportDroppedChoices(recorder, resp, ProtocolOpenAIResponses)
+
 	content, finishReason := firstResponseContent(resp)
 	response := openAIResponsesResponse{
 		ID:         resp.ID,
@@ -218,6 +235,9 @@ func (a OpenAIResponsesAdapter) EncodeResponse(resp *LLMResponse, opts EncodeRes
 	response.Output = append(response.Output, encodeOpenAIResponsesResponseToolCalls(content, finishReason)...)
 	response.Output = append(response.Output, encodeOpenAIResponsesResponseToolResults(content, finishReason)...)
 
+	if err := recorder.attachToResponse(resp, opts.LossPolicy); err != nil {
+		return nil, err
+	}
 	return json.Marshal(response)
 }
 
@@ -226,7 +246,15 @@ func (a OpenAIResponsesAdapter) NewStreamDecoder(StreamDecodeOptions) (StreamDec
 }
 
 func (a OpenAIResponsesAdapter) NewStreamEncoder(opts StreamEncodeOptions) (StreamEncoder, error) {
-	return &openAIResponsesStreamEncoder{model: opts.Model}, nil
+	encoder := newOpenAIResponsesStreamEncoder(opts)
+	return &encoder, nil
+}
+
+// newOpenAIResponsesStreamEncoder is the one place a Responses stream encoder is
+// built. See newOpenAIChatStreamEncoder for why the bridges must not assemble one
+// themselves. Responses events carry no timestamp, so Created has no effect here.
+func newOpenAIResponsesStreamEncoder(opts StreamEncodeOptions) openAIResponsesStreamEncoder {
+	return openAIResponsesStreamEncoder{onWarning: opts.OnWarning, model: opts.Model}
 }
 
 func (a OpenAIResponsesAdapter) EncodeError(err error) ([]byte, int) {
@@ -1393,6 +1421,12 @@ type openAIResponsesStreamEvent struct {
 	Usage          *openAIResponsesUsage             `json:"usage,omitempty"`
 	Error          any                               `json:"error,omitempty"`
 	Output         []openAIResponsesStreamItem       `json:"output,omitempty"`
+
+	// The bare error event carries its detail at the top level, unlike
+	// response.failed, which nests it under response.error.
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
+	Param   string `json:"param,omitempty"`
 }
 
 type openAIResponsesStreamResponse struct {
@@ -1436,6 +1470,7 @@ type openAIResponsesAnnotation struct {
 
 type openAIResponsesStreamDecoder struct {
 	started           bool
+	finished          bool
 	activeTextID      string
 	activeReasoningID string
 	startedText       map[string]bool
@@ -1604,6 +1639,7 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 			return nil, nil
 		}
 	case "response.completed":
+		d.finished = true
 		parts := make([]StreamPart, 0, 2)
 		finish := StreamPart{Type: StreamFinish}
 		if raw.Response != nil {
@@ -1622,6 +1658,7 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 		parts = append(parts, finish)
 		return parts, nil
 	case "response.incomplete":
+		d.finished = true
 		parts := make([]StreamPart, 0, 2)
 		finish := StreamPart{Type: StreamFinish, FinishReason: FinishOther}
 		if raw.Response != nil {
@@ -1638,12 +1675,45 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 		parts = append(parts, finish)
 		return parts, nil
 	case "response.failed":
-		return []StreamPart{{Type: StreamError, Error: raw.Error}}, nil
+		d.finished = true
+		return []StreamPart{{Type: StreamError, Error: responsesStreamError(raw)}}, nil
 	case "error":
-		return []StreamPart{{Type: StreamError, Error: raw.Error}}, nil
+		return []StreamPart{{Type: StreamError, Error: responsesStreamError(raw)}}, nil
 	default:
 		return []StreamPart{{Type: StreamRaw, RawValue: raw}}, nil
 	}
+}
+
+// responsesStreamError pulls the provider error out of whichever place the
+// Responses API put it: nested under response.error for response.failed, or at
+// the top level for the bare error event. Reading only the top-level field, as
+// this decoder used to, turned every failed response into a nil error.
+func responsesStreamError(raw openAIResponsesStreamEvent) any {
+	if raw.Response != nil && raw.Response.Error != nil {
+		return raw.Response.Error
+	}
+	if raw.Error != nil {
+		return raw.Error
+	}
+	if raw.Message != "" || raw.Code != "" {
+		return map[string]any{"code": raw.Code, "message": raw.Message}
+	}
+	return nil
+}
+
+// responsesErrorObject renders a provider error as the ResponseError object
+// that response.error is specified to hold, dropping fields the upstream did
+// not supply instead of forwarding a foreign error shape verbatim.
+func responsesErrorObject(value any) map[string]any {
+	message := errorMessage(value)
+	if message == "" {
+		message = "unknown error"
+	}
+	object := map[string]any{"message": message}
+	if code := errorCode(value); code != "" {
+		object["code"] = code
+	}
+	return object
 }
 
 func (d *openAIResponsesStreamDecoder) rememberImageGenerationUsage(item openAIResponsesStreamItem, outputIndex *int) {
@@ -1835,10 +1905,14 @@ func (d *openAIResponsesStreamDecoder) clearActiveTool(itemID string) {
 }
 
 func (d *openAIResponsesStreamDecoder) Close() ([]StreamPart, error) {
-	return nil, nil
+	if !d.started || d.finished {
+		return nil, nil
+	}
+	return []StreamPart{{Type: StreamError, Error: truncatedStreamError()}}, nil
 }
 
 type openAIResponsesStreamEncoder struct {
+	onWarning      func(Warning)
 	model          string
 	started        bool
 	finished       bool
@@ -2014,7 +2088,11 @@ func (e *openAIResponsesStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent
 	case StreamError:
 		return e.encodeStreamError(part)
 	case StreamRaw:
-		return e.singleOpenAIResponsesStreamEvent("raw", openAIResponsesStreamEvent{Type: "raw", Delta: fmt.Sprint(part.RawValue)})
+		// The "raw" event this used to emit was a type no Responses client has
+		// ever heard of. The frame goes to the host's callback instead.
+		reportStreamLoss(e.onWarning, ProtocolOpenAIResponses, LossUnsupportedStreamEvent, "stream",
+			"an upstream stream event this package does not model was not forwarded", rawStreamText(part.RawValue))
+		return nil, nil
 	default:
 		return nil, nil
 	}
@@ -2090,7 +2168,10 @@ func (e *openAIResponsesStreamEncoder) encodeFinish(part StreamPart) ([]RawStrea
 		status = "failed"
 		eventType = "response.failed"
 	}
-	resp := openAIResponsesStreamResponse{ID: e.responseID, Object: "response", Status: status, Error: part.Error, IncompleteDetails: incompleteDetails, Model: e.model}
+	resp := openAIResponsesStreamResponse{ID: e.responseID, Object: "response", Status: status, IncompleteDetails: incompleteDetails, Model: e.model}
+	if part.Error != nil {
+		resp.Error = responsesErrorObject(part.Error)
+	}
 	if part.Usage.InputTokens != nil || part.Usage.OutputTokens != nil {
 		u := encodeOpenAIResponsesUsage(part.Usage, billingUsageForProtocol(ProtocolOpenAIResponses, part.Usage))
 		resp.Usage = &u
@@ -2102,7 +2183,19 @@ func (e *openAIResponsesStreamEncoder) encodeFinish(part StreamPart) ([]RawStrea
 }
 
 func (e *openAIResponsesStreamEncoder) encodeStreamError(part StreamPart) ([]RawStreamEvent, error) {
-	return e.singleOpenAIResponsesStreamEvent("error", openAIResponsesStreamEvent{Type: "error", Error: part.Error})
+	// The Responses error event carries code/message at the top level. Nesting
+	// them under "error", as this encoder used to, is not the documented shape
+	// and leaves codex without a message to show.
+	message := errorMessage(part.Error)
+	if message == "" {
+		message = "unknown error"
+	}
+	return e.singleOpenAIResponsesStreamEvent("error", openAIResponsesStreamEvent{
+		Type:    "error",
+		Message: message,
+		Code:    errorCode(part.Error),
+		Param:   errorParam(part.Error),
+	})
 }
 
 func (e *openAIResponsesStreamEncoder) nextItemID(prefix string) string {

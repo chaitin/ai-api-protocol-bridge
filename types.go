@@ -54,7 +54,20 @@ type LLMRequest struct {
 
 	Metadata map[string]string `json:"metadata,omitempty"`
 
+	// ProviderOptions is not read by any converter and is not forwarded to the
+	// upstream. It carried no behaviour when this was written, and setting it is
+	// a silent no-op: nothing in the package reads it, and a test pins that
+	// setting it leaves the encoded request byte-identical.
+	//
+	// Deprecated: it will be removed in the next major version. A caller that
+	// needs a provider-specific field should pass it through its own layer rather
+	// than expect this package to relay it.
 	ProviderOptions map[string]any `json:"provider_options,omitempty"`
+
+	// Warnings collects what decoding the inbound request, and then encoding it
+	// for the upstream, could not carry across. A host should read it after
+	// encoding; LossPolicy can turn the unacceptable ones into an error.
+	Warnings []Warning `json:"warnings,omitempty"`
 }
 
 type Message struct {
@@ -62,6 +75,14 @@ type Message struct {
 
 	Parts []Part `json:"parts,omitempty"`
 
+	// ProviderOptions is not read by any converter and is not forwarded to the
+	// upstream. It carried no behaviour when this was written, and setting it is
+	// a silent no-op: nothing in the package reads it, and a test pins that
+	// setting it leaves the encoded request byte-identical.
+	//
+	// Deprecated: it will be removed in the next major version. A caller that
+	// needs a provider-specific field should pass it through its own layer rather
+	// than expect this package to relay it.
 	ProviderOptions map[string]any `json:"provider_options,omitempty"`
 }
 
@@ -85,6 +106,14 @@ type Part struct {
 	ToolCall   *ToolCallPart   `json:"tool_call,omitempty"`
 	ToolResult *ToolResultPart `json:"tool_result,omitempty"`
 
+	// ProviderOptions is not read by any converter and is not forwarded to the
+	// upstream. It carried no behaviour when this was written, and setting it is
+	// a silent no-op: nothing in the package reads it, and a test pins that
+	// setting it leaves the encoded request byte-identical.
+	//
+	// Deprecated: it will be removed in the next major version. A caller that
+	// needs a provider-specific field should pass it through its own layer rather
+	// than expect this package to relay it.
 	ProviderOptions map[string]any `json:"provider_options,omitempty"`
 }
 
@@ -173,6 +202,14 @@ type Tool struct {
 	Strict      *bool          `json:"strict,omitempty"`
 	Config      map[string]any `json:"config,omitempty"`
 
+	// ProviderOptions is not read by any converter and is not forwarded to the
+	// upstream. It carried no behaviour when this was written, and setting it is
+	// a silent no-op: nothing in the package reads it, and a test pins that
+	// setting it leaves the encoded request byte-identical.
+	//
+	// Deprecated: it will be removed in the next major version. A caller that
+	// needs a provider-specific field should pass it through its own layer rather
+	// than expect this package to relay it.
 	ProviderOptions map[string]any `json:"provider_options,omitempty"`
 }
 
@@ -280,6 +317,17 @@ const (
 	FinishUnknown       FinishReason = "unknown"
 )
 
+// Usage is token accounting in the reporting protocol's own terms, and the
+// terms differ.
+//
+// For the two OpenAI protocols InputTokens is the prompt total, with the cached
+// portion broken out in CachedInputTokens. For Anthropic InputTokens excludes
+// what was served from cache, and the cached count is in CacheReadInputTokens.
+// Nothing in this struct says which reading applies, because it cannot: to turn
+// these numbers into a bill, use LLMResponse.BillingUsage or
+// billingUsageForProtocol with the protocol the numbers came from. Reading the
+// fields directly and treating them as one definition is how a cached prompt
+// gets counted twice or not at all.
 type Usage struct {
 	InputTokens              *int `json:"input_tokens,omitempty"`
 	OutputTokens             *int `json:"output_tokens,omitempty"`
@@ -289,28 +337,39 @@ type Usage struct {
 	CacheReadInputTokens     *int `json:"cache_read_input_tokens,omitempty"`
 }
 
+// mergeUsage folds a later usage report into an accumulator.
+//
+// A field the update omits keeps its previous value, and so does a field the
+// update reports as zero. Providers differ on whether a count they are not
+// restating is omitted or sent as 0, and for Anthropic that difference is
+// expensive: message_start reports input_tokens once, and a message_delta that
+// repeats it as 0 would otherwise erase the prompt count and leave the host
+// billing nothing for it.
+//
+// The trade-off is that a count cannot be corrected downwards to zero
+// mid-stream. No provider is known to need that, and the final report of a
+// stream is authoritative anyway.
 func mergeUsage(base *Usage, update Usage) {
 	if base == nil {
 		return
 	}
-	if update.InputTokens != nil {
-		base.InputTokens = update.InputTokens
+	mergeUsageCount(&base.InputTokens, update.InputTokens)
+	mergeUsageCount(&base.OutputTokens, update.OutputTokens)
+	mergeUsageCount(&base.ReasoningTokens, update.ReasoningTokens)
+	mergeUsageCount(&base.CachedInputTokens, update.CachedInputTokens)
+	mergeUsageCount(&base.CacheCreationInputTokens, update.CacheCreationInputTokens)
+	mergeUsageCount(&base.CacheReadInputTokens, update.CacheReadInputTokens)
+}
+
+// mergeUsageCount records update unless it is a zero restating nothing.
+func mergeUsageCount(target **int, update *int) {
+	if update == nil {
+		return
 	}
-	if update.OutputTokens != nil {
-		base.OutputTokens = update.OutputTokens
+	if *update == 0 && *target != nil && **target != 0 {
+		return
 	}
-	if update.ReasoningTokens != nil {
-		base.ReasoningTokens = update.ReasoningTokens
-	}
-	if update.CachedInputTokens != nil {
-		base.CachedInputTokens = update.CachedInputTokens
-	}
-	if update.CacheCreationInputTokens != nil {
-		base.CacheCreationInputTokens = update.CacheCreationInputTokens
-	}
-	if update.CacheReadInputTokens != nil {
-		base.CacheReadInputTokens = update.CacheReadInputTokens
-	}
+	*target = update
 }
 
 func hasUsage(usage Usage) bool {
@@ -415,7 +474,25 @@ func billingUsageForProtocol(protocol Protocol, usage Usage) BillingUsage {
 	}
 }
 
+// Warning is one thing a conversion could not carry across, reported by the
+// decoder or encoder that hit it. See Severity for what the grades mean and the
+// Loss* constants for the codes.
 type Warning struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+
+	Severity Severity `json:"severity,omitempty"`
+
+	// Path locates the loss inside the request, such as
+	// "messages[3].content[1]".
+	Path string `json:"path,omitempty"`
+
+	From Protocol `json:"from,omitempty"`
+	To   Protocol `json:"to,omitempty"`
+
+	// Detail carries the text a loss refers to when the loss is itself some text
+	// that had nowhere to go — an upstream stream frame this package does not
+	// model, for instance. It is empty for losses that are a field or a value
+	// rather than a payload.
+	Detail string `json:"detail,omitempty"`
 }

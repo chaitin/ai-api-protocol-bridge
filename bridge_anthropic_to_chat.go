@@ -47,7 +47,7 @@ func (b anthropicToOpenAIChatBridge) NewStreamDecoder(opts StreamDecodeOptions) 
 }
 
 func (b anthropicToOpenAIChatBridge) NewStreamEncoder(opts StreamEncodeOptions) (StreamEncoder, error) {
-	return &anthropicStreamEncoderForChatUpstream{ant: anthropicStreamEncoder{model: opts.Model}}, nil
+	return &anthropicStreamEncoderForChatUpstream{ant: newAnthropicStreamEncoder(opts)}, nil
 }
 
 // anthropicStreamEncoderForChatUpstream writes neutral stream parts as Anthropic

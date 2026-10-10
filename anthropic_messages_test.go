@@ -2,6 +2,7 @@ package protocolbridge
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -363,7 +364,11 @@ func TestAnthropicMessagesThinkingBudgetOverride(t *testing.T) {
 	}
 }
 
-func TestAnthropicMessagesDecodeAdaptiveThinkingIgnoresOutputEffort(t *testing.T) {
+// thinking.type is what decides whether reasoning is on; output_config.effort is
+// not a second switch. "adaptive" is Anthropic's mode where the model picks how
+// much to think, so it is reasoning on, and reading it as off dropped thinking
+// from a request that asked for it.
+func TestAnthropicMessagesDecodeAdaptiveThinkingEnablesReasoning(t *testing.T) {
 	adapter := NewAnthropicMessagesAdapter()
 	req, err := adapter.DecodeRequest([]byte(`{
 		"model":"claude",
@@ -379,8 +384,8 @@ func TestAnthropicMessagesDecodeAdaptiveThinkingIgnoresOutputEffort(t *testing.T
 	if req.ReasoningEffort != "high" {
 		t.Fatalf("ReasoningEffort = %q, want high", req.ReasoningEffort)
 	}
-	if req.Reasoning != nil && *req.Reasoning {
-		t.Fatalf("Reasoning = %v, want not enabled by bool", req.Reasoning)
+	if req.Reasoning == nil || !*req.Reasoning {
+		t.Fatalf("Reasoning = %v, want enabled", req.Reasoning)
 	}
 	if req.Metadata["user_id"] != "session-1" {
 		t.Fatalf("Metadata = %+v", req.Metadata)
@@ -1024,9 +1029,11 @@ func TestReasoningConvertsAcrossProtocols(t *testing.T) {
 	if err := json.Unmarshal(anthropicRaw, &anthropicDecoded); err != nil {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
+	// 2048 is what the level "medium" maps to. This used to be the 1024 floor for
+	// every level, because the chat adapter dropped the level on decode.
 	thinking := anthropicDecoded["thinking"].(map[string]any)
-	if thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(defaultThinkingBudgetTokens) {
-		t.Fatalf("anthropic thinking = %+v", thinking)
+	if thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(2048) {
+		t.Fatalf("anthropic thinking = %+v, want the medium budget", thinking)
 	}
 
 	anthropicReq, err := NewAnthropicMessagesAdapter().DecodeRequest([]byte(`{
@@ -1064,7 +1071,10 @@ func TestReasoningConvertsAcrossProtocols(t *testing.T) {
 	}
 }
 
-func TestAnthropicMessagesEncodeImageFileIDOnlyKeepsWarningText(t *testing.T) {
+// Anthropic has no way to resolve a provider file id, so the file is dropped.
+// It must be reported rather than turned into a text block the model would read
+// as part of the conversation.
+func TestAnthropicMessagesEncodeImageFileIDOnlyIsReportedNotInjected(t *testing.T) {
 	adapter := NewAnthropicMessagesAdapter()
 	req := &LLMRequest{
 		Model: "claude",
@@ -1084,8 +1094,21 @@ func TestAnthropicMessagesEncodeImageFileIDOnlyKeepsWarningText(t *testing.T) {
 	}
 	messages := decoded["messages"].([]any)
 	content := messages[0].(map[string]any)["content"].([]any)
-	if len(content) != 1 || content[0].(map[string]any)["type"] != "text" || !strings.Contains(content[0].(map[string]any)["text"].(string), "file_123") {
-		t.Fatalf("content = %+v", content)
+	if len(content) != 0 {
+		t.Fatalf("content = %+v, want no block for an unresolvable file", content)
+	}
+	if len(req.Warnings) != 1 {
+		t.Fatalf("warnings = %+v", req.Warnings)
+	}
+	warning := req.Warnings[0]
+	if warning.Code != LossUnsupportedFileReference || warning.Severity != SeverityWarning {
+		t.Fatalf("warning = %+v", warning)
+	}
+	if !strings.Contains(warning.Message, "file_123") {
+		t.Fatalf("warning message = %q", warning.Message)
+	}
+	if warning.Path != "messages[0].content[0]" {
+		t.Fatalf("warning path = %q", warning.Path)
 	}
 }
 
@@ -1114,8 +1137,8 @@ func TestAnthropicMessagesEncodeDocumentsUseStableSources(t *testing.T) {
 	}
 	messages := decoded["messages"].([]any)
 	content := messages[0].(map[string]any)["content"].([]any)
-	if len(content) != 4 {
-		t.Fatalf("content = %+v", content)
+	if len(content) != 2 {
+		t.Fatalf("content = %+v, want only the two files Anthropic can carry", content)
 	}
 	pdf := content[0].(map[string]any)
 	pdfSource := pdf["source"].(map[string]any)
@@ -1127,12 +1150,53 @@ func TestAnthropicMessagesEncodeDocumentsUseStableSources(t *testing.T) {
 	if text["type"] != "document" || textSource["type"] != "text" || textSource["media_type"] != "text/plain" || textSource["data"] != "plain text" {
 		t.Fatalf("text = %+v", text)
 	}
-	remoteWarning := content[2].(map[string]any)
-	if remoteWarning["type"] != "text" || !strings.Contains(remoteWarning["text"].(string), "remote.pdf") {
-		t.Fatalf("remote warning = %+v", remoteWarning)
+	if len(req.Warnings) != 2 {
+		t.Fatalf("warnings = %+v, want one per dropped file", req.Warnings)
 	}
-	xlsWarning := content[3].(map[string]any)
-	if xlsWarning["type"] != "text" || !strings.Contains(xlsWarning["text"].(string), "sheet.xls") {
-		t.Fatalf("xls warning = %+v", xlsWarning)
+	if req.Warnings[0].Code != LossUnsupportedFileReference || !strings.Contains(req.Warnings[0].Message, "remote.pdf") {
+		t.Fatalf("remote warning = %+v", req.Warnings[0])
+	}
+	if req.Warnings[1].Code != LossUnsupportedFileInput || !strings.Contains(req.Warnings[1].Message, "sheet.xls") {
+		t.Fatalf("xls warning = %+v", req.Warnings[1])
+	}
+}
+
+// Under LossPolicySafe a dropped tool fails the conversion, because the model
+// can no longer call it.
+func TestAnthropicMessagesEncodeDroppedToolFailsUnderSafePolicy(t *testing.T) {
+	adapter := NewAnthropicMessagesAdapter()
+	req := &LLMRequest{
+		Model:  "claude",
+		Prompt: []Message{{Role: RoleUser, Parts: []Part{{Type: PartText, Text: &TextPart{Text: "hi"}}}}},
+		Tools:  []Tool{{Type: ToolProviderDefined, Name: "web_search_preview"}},
+	}
+
+	_, err := adapter.EncodeRequest(req, EncodeRequestOptions{Model: "claude", LossPolicy: LossPolicySafe})
+	var conversion *ConversionError
+	if !errors.As(err, &conversion) {
+		t.Fatalf("EncodeRequest() error = %v, want a *ConversionError", err)
+	}
+	if len(conversion.Warnings) != 1 || conversion.Warnings[0].Code != LossUnsupportedTool {
+		t.Fatalf("conversion warnings = %+v", conversion.Warnings)
+	}
+	if !strings.Contains(conversion.Error(), "web_search_preview") {
+		t.Fatalf("error = %q", conversion.Error())
+	}
+	// The losses are still reported on the request the caller handed in.
+	if len(req.Warnings) != 1 {
+		t.Fatalf("request warnings = %+v", req.Warnings)
+	}
+
+	// A file loss is only a warning, so the safe policy lets it through.
+	fileRequest := &LLMRequest{
+		Model:  "claude",
+		Prompt: []Message{{Role: RoleUser, Parts: []Part{{Type: PartFile, File: &FilePart{Type: FileDocument, FileID: "file_1"}}}}},
+	}
+	if _, err := adapter.EncodeRequest(fileRequest, EncodeRequestOptions{Model: "claude", LossPolicy: LossPolicySafe}); err != nil {
+		t.Fatalf("EncodeRequest() error = %v, want a file loss to be tolerated", err)
+	}
+	// The strict policy refuses it.
+	if _, err := adapter.EncodeRequest(fileRequest, EncodeRequestOptions{Model: "claude", LossPolicy: LossPolicyStrict}); err == nil {
+		t.Fatal("EncodeRequest() error = nil, want strict to refuse a warning-severity loss")
 	}
 }

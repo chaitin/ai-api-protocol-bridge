@@ -86,16 +86,20 @@ func (a AnthropicMessagesAdapter) EncodeRequest(req *LLMRequest, opts EncodeRequ
 		Stream:        req.Stream,
 		Metadata:      encodeAnthropicMetadata(req.Metadata),
 	}
+	recorder := newLossRecorder(req.Protocol, ProtocolAnthropicMessages)
+	reportUnsupportedInclude(recorder, req.Include, ProtocolAnthropicMessages)
+	reportUnsupportedAnthropicTools(recorder, req.Tools)
+
 	request.OutputConfig = encodeAnthropicOutputConfig(req.ResponseFormat)
-	request.Thinking = encodeAnthropicThinking(req.Reasoning, req.ReasoningBudgetTokens, request.MaxTokens)
+	request.Thinking = encodeAnthropicThinking(req.Reasoning, req.ReasoningEffort, req.ReasoningBudgetTokens, request.MaxTokens, recorder)
 	request.ToolChoice = encodeAnthropicToolChoice(sanitizeAnthropicToolChoice(req.ToolChoice, request.Thinking), req.ParallelToolCalls)
 
-	for _, message := range req.Prompt {
+	for i, message := range req.Prompt {
 		if message.Role == RoleSystem || message.Role == RoleDeveloper {
 			request.System = appendSystemText(request.System, joinTextParts(message.Parts))
 			continue
 		}
-		encoded := encodeAnthropicMessage(message)
+		encoded := encodeAnthropicMessage(message, recorder, fmt.Sprintf("messages[%d]", i))
 		if message.Role == RoleTool {
 			encoded.Role = string(RoleUser)
 		}
@@ -105,7 +109,10 @@ func (a AnthropicMessagesAdapter) EncodeRequest(req *LLMRequest, opts EncodeRequ
 		request.Messages = append(request.Messages, encoded)
 	}
 
-	applyAnthropicCache(&request, req.Cache)
+	applyAnthropicCache(&request, req.Cache, opts.CacheControl)
+	if err := recorder.attachTo(req, opts.LossPolicy); err != nil {
+		return nil, err
+	}
 	return json.Marshal(request)
 }
 
@@ -160,18 +167,24 @@ func (a AnthropicMessagesAdapter) EncodeResponse(resp *LLMResponse, opts EncodeR
 		model = opts.Model
 	}
 
+	recorder := newLossRecorder(resp.Protocol, ProtocolAnthropicMessages)
+	reportDroppedChoices(recorder, resp, ProtocolAnthropicMessages)
+
 	content, finishReason := firstResponseContent(resp)
 	response := anthropicResponse{
 		ID:         resp.ID,
 		Type:       "message",
 		Role:       string(RoleAssistant),
 		Model:      model,
-		Content:    encodeAnthropicContent(content),
+		Content:    encodeAnthropicContent(content, recorder, "content"),
 		StopReason: encodeAnthropicStopReason(finishReason),
 		Usage:      encodeAnthropicUsage(resp.Usage, resp.BillingUsage()),
 	}
 	if finishReason == FinishContentFilter {
 		response.StopDetails = &anthropicStopDetails{Type: "refusal", Explanation: firstRefusalText(content)}
+	}
+	if err := recorder.attachToResponse(resp, opts.LossPolicy); err != nil {
+		return nil, err
 	}
 
 	return json.Marshal(response)
@@ -182,7 +195,15 @@ func (a AnthropicMessagesAdapter) NewStreamDecoder(StreamDecodeOptions) (StreamD
 }
 
 func (a AnthropicMessagesAdapter) NewStreamEncoder(opts StreamEncodeOptions) (StreamEncoder, error) {
-	return &anthropicStreamEncoder{model: opts.Model}, nil
+	encoder := newAnthropicStreamEncoder(opts)
+	return &encoder, nil
+}
+
+// newAnthropicStreamEncoder is the one place an Anthropic stream encoder is
+// built. See newOpenAIChatStreamEncoder for why the bridges must not assemble one
+// themselves. Anthropic events carry no timestamp, so Created has no effect here.
+func newAnthropicStreamEncoder(opts StreamEncodeOptions) anthropicStreamEncoder {
+	return anthropicStreamEncoder{onWarning: opts.OnWarning, model: opts.Model}
 }
 
 func (a AnthropicMessagesAdapter) EncodeError(err error) ([]byte, int) {
@@ -215,6 +236,8 @@ type anthropicStreamDecoder struct {
 	blockTypes map[int]StreamPartType
 	toolIDs    map[int]string
 	usage      Usage
+	started    bool
+	finished   bool
 }
 
 func (d *anthropicStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, error) {
@@ -226,6 +249,7 @@ func (d *anthropicStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, err
 	if err := json.Unmarshal(event.Data, &raw); err != nil {
 		return nil, fmt.Errorf("decode anthropic stream event: %w", err)
 	}
+	d.started = true
 
 	switch raw.Type {
 	case "message_start":
@@ -258,11 +282,17 @@ func (d *anthropicStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, err
 			usage = *raw.Usage
 		}
 		mergeUsage(&d.usage, decodeAnthropicUsage(usage))
+		if strings.TrimSpace(raw.Delta.StopReason) != "" {
+			d.finished = true
+		}
 		finish := StreamPart{Type: StreamFinish, FinishReason: decodeAnthropicStopReason(raw.Delta.StopReason), Usage: d.usage}
 		return []StreamPart{finish}, nil
 	case "message_stop":
+		d.finished = true
 		return nil, nil
 	case "error":
+		// A provider error is a deliberate end of the stream, not a truncation.
+		d.finished = true
 		return []StreamPart{{Type: StreamError, Error: raw.Error}}, nil
 	case "ping":
 		return nil, nil
@@ -272,7 +302,10 @@ func (d *anthropicStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, err
 }
 
 func (d *anthropicStreamDecoder) Close() ([]StreamPart, error) {
-	return nil, nil
+	if !d.started || d.finished {
+		return nil, nil
+	}
+	return []StreamPart{{Type: StreamError, Error: truncatedStreamError()}}, nil
 }
 
 func (d *anthropicStreamDecoder) setBlockType(index int, partType StreamPartType) {
@@ -353,6 +386,7 @@ func decodeAnthropicContentBlockDelta(raw anthropicStreamEvent, toolID string) [
 }
 
 type anthropicStreamEncoder struct {
+	onWarning    func(Warning)
 	model        string
 	nextIndex    int
 	activeText   map[string]int
@@ -480,10 +514,17 @@ func (e *anthropicStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent, erro
 		e.finished = true
 		return e.encodeFinish(part), nil
 	case StreamError:
-		return singleAnthropicStreamEvent("error", anthropicStreamEvent{Type: "error", Error: part.Error})
+		message := errorMessage(part.Error)
+		if message == "" {
+			message = "unknown error"
+		}
+		return singleAnthropicStreamEvent("error", anthropicStreamEvent{Type: "error", Error: anthropicError{Type: anthropicErrorType(part.Error), Message: message}})
 	case StreamRaw:
-		delta := anthropicStreamDelta{Type: "raw", Text: fmt.Sprint(part.RawValue)}
-		return singleAnthropicStreamEvent("raw", anthropicStreamEvent{Type: "raw", Delta: &delta})
+		// The "raw" event this used to emit was a type no Anthropic client has
+		// ever heard of. The frame goes to the host's callback instead.
+		reportStreamLoss(e.onWarning, ProtocolAnthropicMessages, LossUnsupportedStreamEvent, "stream",
+			"an upstream stream event this package does not model was not forwarded", rawStreamText(part.RawValue))
+		return nil, nil
 	default:
 		return nil, nil
 	}
@@ -633,10 +674,10 @@ func intValueOrZero(value *int) int {
 	return *value
 }
 
-func encodeAnthropicMessage(message Message) anthropicMessage {
+func encodeAnthropicMessage(message Message, recorder *lossRecorder, path string) anthropicMessage {
 	return anthropicMessage{
 		Role:    string(message.Role),
-		Content: encodeAnthropicContent(message.Parts),
+		Content: encodeAnthropicContent(message.Parts, recorder, path+".content"),
 	}
 }
 
@@ -680,9 +721,15 @@ func decodeAnthropicContent(blocks []anthropicContentBlock) []Part {
 	return parts
 }
 
-func encodeAnthropicContent(parts []Part) []anthropicContentBlock {
+func encodeAnthropicContent(parts []Part, recorder *lossRecorder, path string) []anthropicContentBlock {
 	blocks := make([]anthropicContentBlock, 0, len(parts))
-	for _, part := range parts {
+	for i, part := range parts {
+		partPath := path
+		if partPath == "" {
+			partPath = fmt.Sprintf("[%d]", i)
+		} else if !strings.HasSuffix(partPath, "]") {
+			partPath = fmt.Sprintf("%s[%d]", partPath, i)
+		}
 		switch part.Type {
 		case PartText:
 			if part.Text != nil {
@@ -704,9 +751,13 @@ func encodeAnthropicContent(parts []Part) []anthropicContentBlock {
 			if part.File != nil {
 				if block, ok := encodeAnthropicFile(part.File); ok {
 					blocks = append(blocks, block)
-				} else {
-					blocks = append(blocks, anthropicContentBlock{Type: "text", Text: unsupportedFileWarningText(part.File)})
+					break
 				}
+				// Anthropic cannot take this file. Report it rather than
+				// writing a warning into the conversation, which would change
+				// what the model is asked about and invalidate the cached
+				// prefix.
+				recorder.reportUnsupportedFile(partPath, part.File)
 			}
 		case PartToolCall:
 			if part.ToolCall != nil {
@@ -714,7 +765,7 @@ func encodeAnthropicContent(parts []Part) []anthropicContentBlock {
 			}
 		case PartToolResult:
 			if part.ToolResult != nil {
-				blocks = append(blocks, encodeAnthropicToolResult(part.ToolResult))
+				blocks = append(blocks, encodeAnthropicToolResult(part.ToolResult, recorder, partPath+".content"))
 			}
 		}
 	}
@@ -771,23 +822,6 @@ func encodeAnthropicFile(file *FilePart) (anthropicContentBlock, bool) {
 	return anthropicContentBlock{Type: blockType, Source: source, Title: file.Filename}, true
 }
 
-func unsupportedFileWarningText(file *FilePart) string {
-	if file == nil {
-		return "[Proxy warning: an unsupported file input was omitted while converting to Anthropic Messages.]"
-	}
-	identifier := strings.TrimSpace(file.Filename)
-	if identifier == "" {
-		identifier = strings.TrimSpace(file.FileID)
-	}
-	if identifier == "" {
-		identifier = strings.TrimSpace(file.MediaType)
-	}
-	if identifier == "" {
-		identifier = "unknown file"
-	}
-	return fmt.Sprintf("[Proxy warning: file input %q could not be converted to Anthropic Messages and was omitted. Provide a URL, base64 image, PDF, or plain text content instead.]", identifier)
-}
-
 func decodeAnthropicToolResult(block anthropicContentBlock) ToolResultOutput {
 	outputType := ToolResultText
 	if block.IsError {
@@ -812,13 +846,13 @@ func decodeAnthropicToolResult(block anthropicContentBlock) ToolResultOutput {
 	return ToolResultOutput{Type: outputType, Text: text}
 }
 
-func encodeAnthropicToolResult(result *ToolResultPart) anthropicContentBlock {
+func encodeAnthropicToolResult(result *ToolResultPart, recorder *lossRecorder, path string) anthropicContentBlock {
 	block := anthropicContentBlock{Type: "tool_result", ToolUseID: result.ToolCallID}
 	if result.Output.Type == ToolResultErrorText || result.Output.Type == ToolResultErrorJSON {
 		block.IsError = true
 	}
 	if result.Output.Type == ToolResultContent {
-		block.Content = encodeAnthropicContent(result.Output.Content)
+		block.Content = encodeAnthropicContent(result.Output.Content, recorder, path)
 	} else {
 		block.Content = encodeToolResultText(result.Output)
 	}
@@ -835,7 +869,10 @@ func decodeAnthropicThinking(raw any) *bool {
 	if err := json.Unmarshal(asRawMessage(raw), &thinking); err != nil {
 		return nil
 	}
-	enabled := thinking.Type == "enabled"
+	// "adaptive" is Anthropic's mode where the model decides how much to think.
+	// Reading it as disabled dropped thinking from a request that asked for it,
+	// and the separate level decode already reports it as high.
+	enabled := thinking.Type == "enabled" || thinking.Type == "adaptive"
 	return &enabled
 }
 
@@ -873,15 +910,85 @@ func decodeAnthropicReasoningEffort(thinking any) string {
 	}
 }
 
-func encodeAnthropicThinking(reasoning *bool, budgetTokens *int, maxTokens *int) any {
-	if reasoning == nil || !*reasoning {
+// reasoningBudgetForEffort maps an OpenAI reasoning level onto an Anthropic
+// thinking budget.
+//
+// Anthropic's floor is 1024 tokens, so minimal and low both land on it and read
+// back as medium. The level itself stays on the unified request, so a caller that
+// needs the exact word reads that instead of round-tripping a budget.
+func reasoningBudgetForEffort(effort string) (int, bool) {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "minimal", "low":
+		return minAnthropicThinkingBudgetTokens, true
+	case "medium":
+		return 2048, true
+	case "high":
+		return 4096, true
+	case "xhigh", "max":
+		return 8192, true
+	default:
+		return 0, false
+	}
+}
+
+// encodeAnthropicThinking builds the thinking field, or nil when thinking is off.
+//
+// The budget comes from an explicit budget first, then from the reasoning level,
+// and only then from the bare enabled flag. Anthropic requires the budget to
+// leave room under max_tokens, so a budget derived from a level is clamped into
+// the room available — asking for "high" must not quietly turn thinking off —
+// while an explicit budget is the caller's own number and is reported rather than
+// rewritten.
+func encodeAnthropicThinking(reasoning *bool, effort string, budgetTokens *int, maxTokens *int, recorder *lossRecorder) any {
+	if reasoning != nil && !*reasoning {
 		return nil
 	}
-	budget := anthropicThinkingBudgetTokens(budgetTokens, maxTokens)
+	if strings.EqualFold(strings.TrimSpace(effort), "none") {
+		return nil
+	}
+
+	budget := budgetTokens
+	derived := false
 	if budget == nil {
+		if mapped, ok := reasoningBudgetForEffort(effort); ok {
+			budget = &mapped
+			derived = true
+		}
+	}
+	if budget == nil && (reasoning == nil || !*reasoning) {
 		return nil
 	}
-	return map[string]any{"type": "enabled", "budget_tokens": budget}
+
+	limit := defaultMaxOutputTokens
+	if maxTokens != nil && *maxTokens > 0 {
+		limit = *maxTokens
+	}
+
+	resolved := defaultThinkingBudgetTokens
+	if budget != nil {
+		resolved = *budget
+	}
+
+	if resolved >= limit {
+		if !derived {
+			if recorder != nil {
+				recorder.report(LossDroppedReasoning, "thinking",
+					fmt.Sprintf("thinking budget %d does not leave room under max_tokens %d, so thinking was not requested", resolved, limit),
+					SeverityWarning)
+			}
+			return nil
+		}
+		resolved = limit - 1
+	}
+	if resolved < minAnthropicThinkingBudgetTokens {
+		if recorder != nil {
+			recorder.report(LossDroppedReasoning, "thinking",
+				fmt.Sprintf("max_tokens %d leaves no room for the %d token minimum thinking budget, so thinking was not requested", limit, minAnthropicThinkingBudgetTokens),
+				SeverityWarning)
+		}
+		return nil
+	}
+	return map[string]any{"type": "enabled", "budget_tokens": resolved}
 }
 
 func decodeAnthropicCache(request anthropicRequest) *bool {
@@ -914,8 +1021,22 @@ func anthropicContentHasCacheControl(content any) bool {
 	return false
 }
 
-func applyAnthropicCache(request *anthropicRequest, cache *bool) {
-	if request == nil || (cache != nil && !*cache) {
+// applyAnthropicCache adds a cache_control breakpoint to the last cacheable
+// block, which is what makes Anthropic cache the prefix.
+//
+// The request's own preference is authoritative: a non-nil cache is honoured
+// either way, so a caller that asked for caching gets it and a caller that
+// asked against it does not. Only when the source protocol has no notion of
+// caching at all (cache is nil) does the policy decide.
+func applyAnthropicCache(request *anthropicRequest, cache *bool, policy CacheControlPolicy) {
+	if request == nil {
+		return
+	}
+	if cache != nil {
+		if !*cache {
+			return
+		}
+	} else if policy == CacheControlDisabled {
 		return
 	}
 	cacheControl := &anthropicCacheControl{Type: "ephemeral"}
@@ -993,21 +1114,6 @@ func encodeAnthropicOutputConfig(format *ResponseFormat) *anthropicOutputConfig 
 	return &anthropicOutputConfig{Format: &anthropicOutputFormat{Type: "json_schema", Schema: format.Schema, Strict: format.Strict}}
 }
 
-func anthropicThinkingBudgetTokens(budgetTokens *int, maxTokens *int) *int {
-	maxOutputTokens := defaultMaxOutputTokens
-	if maxTokens != nil && *maxTokens > 0 {
-		maxOutputTokens = *maxTokens
-	}
-	budget := defaultThinkingBudgetTokens
-	if budgetTokens != nil {
-		budget = *budgetTokens
-	}
-	if budget < minAnthropicThinkingBudgetTokens || budget >= maxOutputTokens {
-		return nil
-	}
-	return &budget
-}
-
 func encodeToolResultText(output ToolResultOutput) string {
 	if output.Type == ToolResultContent {
 		return joinTextParts(output.Content)
@@ -1044,9 +1150,10 @@ func encodeAnthropicTools(tools []Tool) []anthropicTool {
 	return encoded
 }
 
-func unsupportedAnthropicToolWarnings(tools []Tool) []string {
-	warnings := make([]string, 0)
-	for _, tool := range tools {
+// reportUnsupportedAnthropicTools records the tools an Anthropic request cannot
+// carry, which the model therefore cannot call.
+func reportUnsupportedAnthropicTools(recorder *lossRecorder, tools []Tool) {
+	for i, tool := range tools {
 		if tool.Type == ToolFunction {
 			continue
 		}
@@ -1057,9 +1164,10 @@ func unsupportedAnthropicToolWarnings(tools []Tool) []string {
 		if name == "" {
 			name = "provider-defined tool"
 		}
-		warnings = append(warnings, fmt.Sprintf("OpenAI Responses tool %q is not available when proxying to Anthropic and was omitted.", name))
+		recorder.report(LossUnsupportedTool, fmt.Sprintf("tools[%d]", i),
+			fmt.Sprintf("tool %q has no Anthropic equivalent and was omitted, so the model cannot call it", name),
+			SeverityError)
 	}
-	return warnings
 }
 
 func decodeAnthropicToolChoice(choice *anthropicToolChoice) *ToolChoice {

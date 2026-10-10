@@ -1,0 +1,45 @@
+{
+  "max_completion_tokens": 4096,
+  "messages": [
+    {
+      "content": "You are a coding agent running in a sandbox. Follow the user's request.",
+      "role": "system"
+    },
+    {
+      "content": "List the files in the working directory.",
+      "role": "user"
+    }
+  ],
+  "model": "upstream-model",
+  "parallel_tool_calls": false,
+  "reasoning_effort": "medium",
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "tool_choice": "auto",
+  "tools": [
+    {
+      "function": {
+        "description": "Run a shell command.",
+        "name": "shell",
+        "parameters": {
+          "properties": {
+            "command": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        },
+        "strict": false
+      },
+      "type": "function"
+    }
+  ]
+}

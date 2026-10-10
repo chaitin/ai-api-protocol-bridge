@@ -7,8 +7,14 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
 
+// ErrStreamUnsupported is never returned. Every adapter in this package
+// implements streaming, so nothing constructs this error and no caller can
+// receive it.
+//
+// Deprecated: it will be removed in the next major version.
 var ErrStreamUnsupported = errors.New("protocolbridge: stream conversion is not implemented")
 
 type OpenAIChatAdapter struct{}
@@ -33,6 +39,8 @@ func (a OpenAIChatAdapter) DecodeRequest(raw []byte) (*LLMRequest, error) {
 	}
 	maxOutputTokens = maxOutputTokensOrDefault(maxOutputTokens)
 
+	reasoning, reasoningEffort := decodeChatReasoningEffort(request.ReasoningEffort)
+
 	llmRequest := &LLMRequest{
 		Protocol:          ProtocolOpenAIChat,
 		Model:             request.Model,
@@ -46,7 +54,8 @@ func (a OpenAIChatAdapter) DecodeRequest(raw []byte) (*LLMRequest, error) {
 		Seed:              request.Seed,
 		CandidateCount:    request.N,
 		ResponseFormat:    decodeOpenAIResponseFormat(asRawMessage(request.ResponseFormat)),
-		Reasoning:         decodeReasoningEffort(request.ReasoningEffort),
+		Reasoning:         reasoning,
+		ReasoningEffort:   reasoningEffort,
 		Tools:             decodeOpenAITools(request.Tools),
 		ToolChoice:        decodeOpenAIToolChoice(asRawMessage(request.ToolChoice)),
 		ParallelToolCalls: request.ParallelToolCalls,
@@ -85,19 +94,24 @@ func (a OpenAIChatAdapter) EncodeRequest(req *LLMRequest, opts EncodeRequestOpti
 		Seed:                req.Seed,
 		N:                   req.CandidateCount,
 		ResponseFormat:      encodeOpenAIResponseFormat(req.ResponseFormat),
-		ReasoningEffort:     encodeReasoningEffort(req.Reasoning),
+		ReasoningEffort:     encodeOpenAIChatReasoningEffort(req),
 		StreamOptions:       encodeOpenAIStreamOptions(req.Stream),
 		Tools:               encodeOpenAITools(req.Tools),
 		ToolChoice:          encodeOpenAIToolChoice(req.ToolChoice),
 		ParallelToolCalls:   req.ParallelToolCalls,
 		Stream:              req.Stream,
 	}
-	for _, message := range req.Prompt {
-		encoded, err := encodeOpenAIChatMessages(message)
+	recorder := newLossRecorder(req.Protocol, ProtocolOpenAIChat)
+	reportUnsupportedInclude(recorder, req.Include, ProtocolOpenAIChat)
+	for i, message := range req.Prompt {
+		encoded, err := encodeOpenAIChatMessages(message, recorder, fmt.Sprintf("messages[%d]", i))
 		if err != nil {
 			return nil, err
 		}
 		request.Messages = append(request.Messages, encoded...)
+	}
+	if err := recorder.attachTo(req, opts.LossPolicy); err != nil {
+		return nil, err
 	}
 
 	return json.Marshal(request)
@@ -153,26 +167,32 @@ func (a OpenAIChatAdapter) EncodeResponse(resp *LLMResponse, opts EncodeResponse
 		model = opts.Model
 	}
 
+	recorder := newLossRecorder(resp.Protocol, ProtocolOpenAIChat)
 	choices := make([]openAIChatChoice, 0)
 	if len(resp.Choices) > 0 {
-		for _, choice := range resp.Choices {
-			message, err := encodeOpenAIAssistantMessage(choice.Content)
+		for i, choice := range resp.Choices {
+			message, err := encodeOpenAIAssistantMessage(choice.Content, recorder, fmt.Sprintf("choices[%d].message.content", i))
 			if err != nil {
 				return nil, err
 			}
 			choices = append(choices, openAIChatChoice{Index: choice.Index, Message: message, FinishReason: encodeOpenAIFinishReason(choice.FinishReason)})
 		}
 	} else {
-		message, err := encodeOpenAIAssistantMessage(resp.Content)
+		message, err := encodeOpenAIAssistantMessage(resp.Content, recorder, "message.content")
 		if err != nil {
 			return nil, err
 		}
 		choices = append(choices, openAIChatChoice{Index: 0, Message: message, FinishReason: encodeOpenAIFinishReason(resp.FinishReason)})
 	}
 
+	created := opts.Created
+	if created == 0 {
+		created = time.Now().Unix()
+	}
 	response := openAIChatResponse{
 		ID:      resp.ID,
 		Object:  "chat.completion",
+		Created: created,
 		Model:   model,
 		Choices: choices,
 		Usage:   encodeOpenAIUsage(resp.Usage, resp.BillingUsage()),
@@ -186,7 +206,23 @@ func (a OpenAIChatAdapter) NewStreamDecoder(StreamDecodeOptions) (StreamDecoder,
 }
 
 func (a OpenAIChatAdapter) NewStreamEncoder(opts StreamEncodeOptions) (StreamEncoder, error) {
-	return &openAIChatStreamEncoder{model: opts.Model, toolIndexes: make(map[string]int)}, nil
+	encoder := newOpenAIChatStreamEncoder(opts)
+	return &encoder, nil
+}
+
+// newOpenAIChatStreamEncoder is the one place a chat stream encoder is built.
+//
+// The bridges used to assemble one out of opts field by field, which silently
+// dropped any option nobody remembered to add — Created was lost by five of the
+// six, and OnWarning would have been lost by all of them. Building from the
+// options struct means a new option reaches every caller or none.
+func newOpenAIChatStreamEncoder(opts StreamEncodeOptions) openAIChatStreamEncoder {
+	return openAIChatStreamEncoder{
+		onWarning:   opts.OnWarning,
+		model:       opts.Model,
+		created:     opts.Created,
+		toolIndexes: make(map[string]int),
+	}
 }
 
 type openAIChatStreamChunk struct {
@@ -233,7 +269,8 @@ type openAIChatStreamChunkUsage struct {
 }
 
 type openAIChatStreamDecoder struct {
-	started bool
+	started  bool
+	finished bool
 }
 
 func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, error) {
@@ -241,6 +278,9 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 		return nil, nil
 	}
 	if string(event.Data) == "[DONE]" {
+		// The sentinel is the provider saying the stream is over, whether or
+		// not it also sent a finish_reason.
+		d.finished = true
 		return nil, nil
 	}
 
@@ -252,7 +292,17 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 	parts := make([]StreamPart, 0)
 	if !d.started {
 		d.started = true
-		part := StreamPart{Type: StreamStart, ID: chunk.ID, ProviderMetadata: map[string]any{"model": chunk.Model}}
+		// The role is folded in rather than sent as a StreamStart of its own.
+		// OpenAI opens every stream with a chunk carrying both the model and the
+		// role, and emitting two start parts for it made every encoder publish
+		// its opening event twice — a Responses client saw response.created and
+		// response.in_progress repeated, and an Anthropic client would see
+		// message_start twice.
+		metadata := map[string]any{"model": chunk.Model}
+		if role := openAIChatStreamRole(chunk); role != "" {
+			metadata["role"] = role
+		}
+		part := StreamPart{Type: StreamStart, ID: chunk.ID, ProviderMetadata: metadata}
 		if chunk.Usage != nil {
 			part.Usage = decodeOpenAIUsage(openAIUsage{
 				PromptTokens:            chunk.Usage.PromptTokens,
@@ -268,9 +318,6 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 	for _, choice := range chunk.Choices {
 		if choice.Delta == nil {
 			continue
-		}
-		if choice.Delta.Role != "" {
-			parts = append(parts, StreamPart{Type: StreamStart, ID: chunk.ID, ProviderMetadata: map[string]any{"role": choice.Delta.Role}})
 		}
 		if choice.Delta.Reasoning != nil && *choice.Delta.Reasoning != "" {
 			parts = append(parts, StreamPart{Type: StreamReasoningDelta, ID: streamIndexID(choice.Index), Delta: *choice.Delta.Reasoning})
@@ -290,6 +337,7 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 			}
 		}
 		if choice.FinishReason != nil && *choice.FinishReason != "" {
+			d.finished = true
 			parts = append(parts, StreamPart{Type: StreamFinish, FinishReason: decodeOpenAIFinishReason(*choice.FinishReason)})
 		}
 	}
@@ -310,13 +358,29 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 	return parts, nil
 }
 
+// openAIChatStreamRole returns the role a chunk announces, if any. Only the
+// chunk that opens a stream normally carries one.
+func openAIChatStreamRole(chunk openAIChatStreamChunk) string {
+	for _, choice := range chunk.Choices {
+		if choice.Delta != nil && choice.Delta.Role != "" {
+			return choice.Delta.Role
+		}
+	}
+	return ""
+}
+
 func (d *openAIChatStreamDecoder) Close() ([]StreamPart, error) {
-	return nil, nil
+	if !d.started || d.finished {
+		return nil, nil
+	}
+	return []StreamPart{{Type: StreamError, Error: truncatedStreamError()}}, nil
 }
 
 type openAIChatStreamEncoder struct {
+	onWarning   func(Warning)
 	model       string
 	responseID  string
+	created     int64
 	started     bool
 	finished    bool
 	usage       Usage
@@ -324,6 +388,17 @@ type openAIChatStreamEncoder struct {
 	toolIndexes map[string]int
 	toolNames   map[string]string
 	toolInputs  map[string]string
+}
+
+// timestamp returns the single timestamp shared by every event of this stream.
+// Stamping each event with time.Now() instead would let a long stream straddle
+// a second boundary and emit two different "created" values, which is not what
+// a provider does and confuses clients that key a completion on it.
+func (e *openAIChatStreamEncoder) timestamp() int64 {
+	if e.created == 0 {
+		e.created = time.Now().Unix()
+	}
+	return e.created
 }
 
 func (e *openAIChatStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent, error) {
@@ -339,30 +414,30 @@ func (e *openAIChatStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent, err
 			e.responseID = part.ID
 		}
 		mergeUsage(&e.usage, part.Usage)
-		chunk := openAIChatStreamChunk{ID: part.ID, Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp()}
+		chunk := openAIChatStreamChunk{ID: part.ID, Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp()}
 		role := "assistant"
 		chunk.Choices = []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{Role: role}}}
 		return singleOpenAIChatStreamEvent(chunk)
 	case StreamTextDelta:
 		content := part.Delta
-		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{Content: &content}}}}
+		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{Content: &content}}}}
 		return singleOpenAIChatStreamEvent(chunk)
 	case StreamReasoningDelta:
 		reasoning := part.Delta
-		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{Reasoning: &reasoning}}}}
+		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{Reasoning: &reasoning}}}}
 		return singleOpenAIChatStreamEvent(chunk)
 	case StreamToolInputStart:
 		idx := e.ensureToolIndex(part.ToolCallID)
 		e.toolNames[part.ToolCallID] = part.ToolName
 		e.toolInputs[part.ToolCallID] = ""
 		tc := openAIChatStreamToolCall{Index: idx, ID: part.ToolCallID, Type: "function", Function: openAIChatStreamToolCallFunction{Name: part.ToolName}}
-		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{ToolCalls: []openAIChatStreamToolCall{tc}}}}}
+		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{ToolCalls: []openAIChatStreamToolCall{tc}}}}}
 		return singleOpenAIChatStreamEvent(chunk)
 	case StreamToolInputDelta:
 		idx := e.ensureToolIndex(part.ToolCallID)
 		e.toolInputs[part.ToolCallID] += part.Delta
 		tc := openAIChatStreamToolCall{Index: idx, Function: openAIChatStreamToolCallFunction{Arguments: part.Delta}}
-		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{ToolCalls: []openAIChatStreamToolCall{tc}}}}}
+		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{ToolCalls: []openAIChatStreamToolCall{tc}}}}}
 		return singleOpenAIChatStreamEvent(chunk)
 	case StreamToolInputEnd:
 		return nil, nil
@@ -378,8 +453,15 @@ func (e *openAIChatStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent, err
 	case StreamError:
 		return e.encodeStreamError(part)
 	case StreamRaw:
-		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{Content: strPtr(fmt.Sprint(part.RawValue))}}}}
-		return singleOpenAIChatStreamEvent(chunk)
+		// An unmodelled upstream frame is not model output, so it must not become
+		// content — that is what put Go syntax in the assistant's answer. Chat has
+		// no raw-event slot either, and inventing a field for one would put
+		// something on the wire no other implementation expects. The frame is
+		// dropped and offered to the host's callback, which is where a host that
+		// cares about it can pick it up.
+		reportStreamLoss(e.onWarning, ProtocolOpenAIChat, LossUnsupportedStreamEvent, "stream",
+			"an upstream stream event this package does not model was not forwarded", rawStreamText(part.RawValue))
+		return nil, nil
 	default:
 		return nil, nil
 	}
@@ -427,13 +509,13 @@ func (e *openAIChatStreamEncoder) encodeToolCall(part StreamPart) ([]RawStreamEv
 		return nil, err
 	}
 	var events []RawStreamEvent
-	startChunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{ToolCalls: []openAIChatStreamToolCall{{Index: idx, ID: toolID, Type: "function", Function: openAIChatStreamToolCallFunction{Name: name}}}}}}}
+	startChunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{ToolCalls: []openAIChatStreamToolCall{{Index: idx, ID: toolID, Type: "function", Function: openAIChatStreamToolCallFunction{Name: name}}}}}}}
 	start, err := singleOpenAIChatStreamEvent(startChunk)
 	if err != nil {
 		return nil, err
 	}
 	events = append(events, start...)
-	deltaChunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{ToolCalls: []openAIChatStreamToolCall{{Index: idx, Function: openAIChatStreamToolCallFunction{Arguments: input}}}}}}}
+	deltaChunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{ToolCalls: []openAIChatStreamToolCall{{Index: idx, Function: openAIChatStreamToolCallFunction{Arguments: input}}}}}}}
 	delta, err := singleOpenAIChatStreamEvent(deltaChunk)
 	if err != nil {
 		return nil, err
@@ -445,7 +527,7 @@ func (e *openAIChatStreamEncoder) encodeToolCall(part StreamPart) ([]RawStreamEv
 
 func (e *openAIChatStreamEncoder) encodeFinish(part StreamPart) ([]RawStreamEvent, error) {
 	reason := encodeOpenAIFinishReason(part.FinishReason)
-	chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{}, FinishReason: &reason}}}
+	chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{}, FinishReason: &reason}}}
 	return singleOpenAIChatStreamEvent(chunk)
 }
 
@@ -458,7 +540,7 @@ func (e *openAIChatStreamEncoder) encodeUsageSummary() ([]RawStreamEvent, error)
 		ID:      e.responseID,
 		Object:  "chat.completion.chunk",
 		Model:   e.model,
-		Created: currentTimestamp(),
+		Created: e.timestamp(),
 		Choices: []openAIChatStreamChoice{},
 		Usage: &openAIChatStreamChunkUsage{
 			PromptTokens:            usage.PromptTokens,
@@ -472,7 +554,17 @@ func (e *openAIChatStreamEncoder) encodeUsageSummary() ([]RawStreamEvent, error)
 }
 
 func (e *openAIChatStreamEncoder) encodeStreamError(part StreamPart) ([]RawStreamEvent, error) {
-	raw, err := json.Marshal(openAIErrorResponse{Error: openAIError{Message: fmt.Sprint(part.Error), Type: "protocol_bridge_error"}})
+	// fmt.Sprint on a decoded error object produced its Go map rendering; read
+	// the message out instead so an upstream failure reaches the client intact.
+	message := errorMessage(part.Error)
+	if message == "" {
+		message = "unknown error"
+	}
+	kind := errorCode(part.Error)
+	if kind == "" {
+		kind = "protocol_bridge_error"
+	}
+	raw, err := json.Marshal(openAIErrorResponse{Error: openAIError{Message: message, Type: kind}})
 	if err != nil {
 		return nil, err
 	}
@@ -495,10 +587,6 @@ func singleOpenAIChatStreamEvent(chunk openAIChatStreamChunk) ([]RawStreamEvent,
 		return nil, err
 	}
 	return []RawStreamEvent{{Data: raw}}, nil
-}
-
-func currentTimestamp() int64 {
-	return 0
 }
 
 func strPtr(s string) *string {
@@ -561,15 +649,19 @@ func decodeOpenAIChatMessage(message openAIChatMessage) (Message, error) {
 		if err != nil {
 			return Message{}, err
 		}
+		output := ToolResultOutput{Type: ToolResultText, Text: joinTextParts(parts)}
+		// Keep media a chat client attached to a tool result. Flattening it to
+		// the text here would discard it before any other protocol could see
+		// it, and the encode side can put it back.
+		if hasNonTextPart(parts) {
+			output = ToolResultOutput{Type: ToolResultContent, Content: parts}
+		}
 		decoded.Parts = []Part{
 			{
 				Type: PartToolResult,
 				ToolResult: &ToolResultPart{
 					ToolCallID: message.ToolCallID,
-					Output: ToolResultOutput{
-						Type: ToolResultText,
-						Text: joinTextParts(parts),
-					},
+					Output:     output,
 				},
 			},
 		}
@@ -578,19 +670,70 @@ func decodeOpenAIChatMessage(message openAIChatMessage) (Message, error) {
 	return decoded, nil
 }
 
-func decodeReasoningEffort(effort string) *bool {
-	if strings.TrimSpace(effort) == "" {
-		return nil
+// decodeChatReasoningEffort returns the unified enabled flag and the level word
+// for a chat reasoning_effort.
+//
+// The level used to be discarded here: any non-empty value became a bare
+// "enabled". That is why reasoning_effort "high" reached an Anthropic upstream
+// as the 1024-token minimum thinking budget — the level never left the adapter.
+// The level is the richer signal, so it is carried on the request and every
+// encoder prefers it over the flag.
+func decodeChatReasoningEffort(effort string) (*bool, string) {
+	level := normalizeReasoningEffort(effort)
+	if level == "" {
+		return nil, ""
 	}
-	enabled := true
-	return &enabled
+	enabled := level != "none"
+	return &enabled, level
 }
 
-func encodeReasoningEffort(reasoning *bool) string {
-	if reasoning == nil || !*reasoning {
+// normalizeReasoningEffort lowercases a level and folds in the words that mean
+// the same thing. It deliberately keeps a level it does not recognise: narrowing
+// the vocabulary is the encoder's job, and decoding is where the caller's word
+// should survive so an upstream that understands it still receives it.
+func normalizeReasoningEffort(effort string) string {
+	level := strings.ToLower(strings.TrimSpace(effort))
+	switch level {
+	case "disabled", "off":
+		return "none"
+	}
+	return level
+}
+
+// normalizeChatReasoningEffort narrows a level to the words chat documents —
+// minimal, low, medium and high. A level above high becomes high rather than
+// being sent as a word a chat endpoint may reject; Responses, which does accept
+// the higher levels, keeps them.
+func normalizeChatReasoningEffort(effort string) string {
+	switch level := normalizeReasoningEffort(effort); level {
+	case "xhigh", "max":
+		return "high"
+	default:
+		return level
+	}
+}
+
+// encodeOpenAIChatReasoningEffort picks the level to send, preferring the richest
+// signal the unified request carries.
+func encodeOpenAIChatReasoningEffort(req *LLMRequest) string {
+	if req == nil {
 		return ""
 	}
-	return "medium"
+	if level := normalizeChatReasoningEffort(req.ReasoningEffort); level != "" {
+		if level == "none" {
+			// Chat has no word for "off"; omitting the field is how a request
+			// declines reasoning.
+			return ""
+		}
+		return level
+	}
+	if req.ReasoningBudgetTokens != nil {
+		return normalizeChatReasoningEffort(mapReasoningBudgetToOpenAIEffort(*req.ReasoningBudgetTokens))
+	}
+	if req.Reasoning != nil && *req.Reasoning {
+		return "medium"
+	}
+	return ""
 }
 
 func encodeOpenAIStreamOptions(stream bool) any {
@@ -600,9 +743,9 @@ func encodeOpenAIStreamOptions(stream bool) any {
 	return map[string]any{"include_usage": true}
 }
 
-func encodeOpenAIChatMessages(message Message) ([]openAIChatMessage, error) {
+func encodeOpenAIChatMessages(message Message, recorder *lossRecorder, path string) ([]openAIChatMessage, error) {
 	if message.Role == RoleTool {
-		return encodeOpenAIToolMessages(message), nil
+		return encodeOpenAIToolMessages(message, recorder, path), nil
 	}
 
 	// A tool result does not have to arrive as a tool-role message: Anthropic
@@ -613,12 +756,12 @@ func encodeOpenAIChatMessages(message Message) ([]openAIChatMessage, error) {
 	// requires them (directly after the assistant turn that made the call), and
 	// encode anything else the message carries under its own role.
 	if hasToolResultPart(message.Parts) {
-		encoded := encodeOpenAIToolMessages(message)
+		encoded := encodeOpenAIToolMessages(message, recorder, path)
 		remaining := withoutToolResultParts(message)
 		if len(remaining.Parts) == 0 {
 			return encoded, nil
 		}
-		rest, err := encodeOpenAIChatMessages(remaining)
+		rest, err := encodeOpenAIChatMessages(remaining, recorder, path)
 		if err != nil {
 			return nil, err
 		}
@@ -627,7 +770,7 @@ func encodeOpenAIChatMessages(message Message) ([]openAIChatMessage, error) {
 
 	encoded := openAIChatMessage{
 		Role:    string(message.Role),
-		Content: encodeOpenAITextContent(message.Parts),
+		Content: encodeOpenAITextContent(message.Parts, recorder, path+".content"),
 	}
 
 	for _, part := range message.Parts {
@@ -682,8 +825,18 @@ func withoutToolResultParts(message Message) Message {
 	return message
 }
 
-func encodeOpenAIToolMessages(message Message) []openAIChatMessage {
+// encodeOpenAIToolMessages renders tool results as the chat protocol's tool
+// messages.
+//
+// A chat tool message carries text only, but a tool result may also hold media:
+// an Anthropic client such as Claude Code returns a screenshot, or an image it
+// read from disk, as an image block inside tool_result content. Flattening that
+// content to its text — which is what this function used to do — hands the
+// model an empty result, so the media is lifted into a single user message
+// emitted after all of the tool messages.
+func encodeOpenAIToolMessages(message Message, recorder *lossRecorder, path string) []openAIChatMessage {
 	encoded := make([]openAIChatMessage, 0)
+	var lifted []Part
 	for _, part := range message.Parts {
 		if part.Type != PartToolResult || part.ToolResult == nil {
 			continue
@@ -693,13 +846,57 @@ func encodeOpenAIToolMessages(message Message) []openAIChatMessage {
 			ToolCallID: part.ToolResult.ToolCallID,
 			Content:    encodeOpenAIToolOutput(part.ToolResult.Output),
 		})
+		lifted = append(lifted, toolResultMediaParts(part.ToolResult.Output)...)
+	}
+	if content := encodeOpenAITextContent(lifted, recorder, path+".content"); !isEmptyOpenAIContent(content) {
+		encoded = append(encoded, openAIChatMessage{Role: string(RoleUser), Content: content})
 	}
 	return encoded
 }
 
-func encodeOpenAIAssistantMessage(content []Part) (openAIChatMessage, error) {
+// toolResultMediaParts returns the parts of a tool result that a chat tool
+// message cannot carry. Text is excluded because encodeOpenAIToolOutput already
+// places it in the tool message, and repeating it would duplicate the output.
+func toolResultMediaParts(output ToolResultOutput) []Part {
+	if output.Type != ToolResultContent {
+		return nil
+	}
+	parts := make([]Part, 0, len(output.Content))
+	for _, part := range output.Content {
+		if part.Type == PartText {
+			continue
+		}
+		parts = append(parts, part)
+	}
+	return parts
+}
+
+func hasNonTextPart(parts []Part) bool {
+	for _, part := range parts {
+		if part.Type != PartText {
+			return true
+		}
+	}
+	return false
+}
+
+// isEmptyOpenAIContent reports whether an encoded chat content value carries
+// nothing, so that callers do not emit an empty message.
+func isEmptyOpenAIContent(content any) bool {
+	switch typed := content.(type) {
+	case nil:
+		return true
+	case string:
+		return typed == ""
+	case []openAIChatContentPart:
+		return len(typed) == 0
+	}
+	return false
+}
+
+func encodeOpenAIAssistantMessage(content []Part, recorder *lossRecorder, path string) (openAIChatMessage, error) {
 	message := Message{Role: RoleAssistant, Parts: content}
-	encoded, err := encodeOpenAIChatMessages(message)
+	encoded, err := encodeOpenAIChatMessages(message, recorder, path)
 	if err != nil {
 		return openAIChatMessage{}, err
 	}
@@ -747,16 +944,27 @@ func decodeOpenAIChatContent(raw json.RawMessage) ([]Part, error) {
 	return decoded, nil
 }
 
-func encodeOpenAITextContent(parts []Part) any {
+func encodeOpenAITextContent(parts []Part, recorder *lossRecorder, path string) any {
 	encoded := make([]openAIChatContentPart, 0, len(parts))
-	for _, part := range parts {
+	for i, part := range parts {
+		partPath := fmt.Sprintf("%s[%d]", path, i)
 		if part.Type == PartText && part.Text != nil {
 			encoded = append(encoded, openAIChatContentPart{Type: "text", Text: part.Text.Text})
+			continue
+		}
+		if part.Type == PartReasoning && part.Reasoning != nil {
+			// Chat completions has no field for a thinking block or an
+			// encrypted reasoning item. The answer itself is unaffected, which
+			// is why this is informational rather than a loss.
+			recorder.report(LossDroppedReasoning, partPath,
+				"chat completions has no reasoning field, so this turn's reasoning was not sent upstream",
+				SeverityInfo)
 			continue
 		}
 		if part.Type == PartFile && part.File != nil && part.File.Type == FileImage {
 			url := encodeFileURL(part.File)
 			if url == "" {
+				recorder.reportUnsupportedFile(partPath, part.File)
 				continue
 			}
 			encoded = append(encoded, openAIChatContentPart{Type: "image_url", ImageURL: &openAIChatImageURL{URL: url, Detail: part.File.Detail}})
@@ -765,6 +973,10 @@ func encodeOpenAITextContent(parts []Part) any {
 		if part.Type == PartFile && part.File != nil && part.File.Type == FileDocument {
 			file := openAIChatFilePart{FileData: part.File.Data, FileID: part.File.FileID, Filename: part.File.Filename}
 			if file.FileData == "" && file.FileID == "" {
+				// The chat file part carries inline data or a provider file id
+				// only. A document that arrives as a plain URL has nowhere to
+				// go here.
+				recorder.reportUnsupportedFile(partPath, part.File)
 				continue
 			}
 			encoded = append(encoded, openAIChatContentPart{Type: "file", File: &file})

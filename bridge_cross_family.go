@@ -51,8 +51,16 @@ func NewCrossFamilyBridge(inbound Protocol, upstreamFamily string) (CrossFamilyB
 // A pair within one family returns false, as does an unserved pair: those need
 // no conversion, or none exists.
 func NewCrossFamilyBridgeForProtocol(inbound, upstream Protocol) (CrossFamilyBridge, bool) {
-	if inbound == ProtocolAnthropicMessages && upstream == ProtocolOpenAIChat {
+	if inbound == upstream {
+		return nil, false
+	}
+	switch {
+	case inbound == ProtocolAnthropicMessages && upstream == ProtocolOpenAIChat:
 		return anthropicToOpenAIChatBridge{adapter: NewOpenAIChatAdapter()}, true
+	case inbound == ProtocolOpenAIResponses && upstream == ProtocolOpenAIChat:
+		return openAIResponsesToOpenAIChatBridge{adapter: NewOpenAIChatAdapter()}, true
+	case inbound == ProtocolOpenAIChat && upstream == ProtocolOpenAIResponses:
+		return openAIChatToOpenAIResponsesBridge{adapter: NewOpenAIResponsesAdapter()}, true
 	}
 	return NewCrossFamilyBridge(inbound, familyForProtocol(upstream))
 }
