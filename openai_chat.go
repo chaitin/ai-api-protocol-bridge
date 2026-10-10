@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
 
 var ErrStreamUnsupported = errors.New("protocolbridge: stream conversion is not implemented")
@@ -170,9 +171,14 @@ func (a OpenAIChatAdapter) EncodeResponse(resp *LLMResponse, opts EncodeResponse
 		choices = append(choices, openAIChatChoice{Index: 0, Message: message, FinishReason: encodeOpenAIFinishReason(resp.FinishReason)})
 	}
 
+	created := opts.Created
+	if created == 0 {
+		created = time.Now().Unix()
+	}
 	response := openAIChatResponse{
 		ID:      resp.ID,
 		Object:  "chat.completion",
+		Created: created,
 		Model:   model,
 		Choices: choices,
 		Usage:   encodeOpenAIUsage(resp.Usage, resp.BillingUsage()),
@@ -186,7 +192,7 @@ func (a OpenAIChatAdapter) NewStreamDecoder(StreamDecodeOptions) (StreamDecoder,
 }
 
 func (a OpenAIChatAdapter) NewStreamEncoder(opts StreamEncodeOptions) (StreamEncoder, error) {
-	return &openAIChatStreamEncoder{model: opts.Model, toolIndexes: make(map[string]int)}, nil
+	return &openAIChatStreamEncoder{model: opts.Model, created: opts.Created, toolIndexes: make(map[string]int)}, nil
 }
 
 type openAIChatStreamChunk struct {
@@ -317,6 +323,7 @@ func (d *openAIChatStreamDecoder) Close() ([]StreamPart, error) {
 type openAIChatStreamEncoder struct {
 	model       string
 	responseID  string
+	created     int64
 	started     bool
 	finished    bool
 	usage       Usage
@@ -324,6 +331,17 @@ type openAIChatStreamEncoder struct {
 	toolIndexes map[string]int
 	toolNames   map[string]string
 	toolInputs  map[string]string
+}
+
+// timestamp returns the single timestamp shared by every event of this stream.
+// Stamping each event with time.Now() instead would let a long stream straddle
+// a second boundary and emit two different "created" values, which is not what
+// a provider does and confuses clients that key a completion on it.
+func (e *openAIChatStreamEncoder) timestamp() int64 {
+	if e.created == 0 {
+		e.created = time.Now().Unix()
+	}
+	return e.created
 }
 
 func (e *openAIChatStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent, error) {
@@ -339,30 +357,30 @@ func (e *openAIChatStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent, err
 			e.responseID = part.ID
 		}
 		mergeUsage(&e.usage, part.Usage)
-		chunk := openAIChatStreamChunk{ID: part.ID, Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp()}
+		chunk := openAIChatStreamChunk{ID: part.ID, Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp()}
 		role := "assistant"
 		chunk.Choices = []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{Role: role}}}
 		return singleOpenAIChatStreamEvent(chunk)
 	case StreamTextDelta:
 		content := part.Delta
-		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{Content: &content}}}}
+		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{Content: &content}}}}
 		return singleOpenAIChatStreamEvent(chunk)
 	case StreamReasoningDelta:
 		reasoning := part.Delta
-		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{Reasoning: &reasoning}}}}
+		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{Reasoning: &reasoning}}}}
 		return singleOpenAIChatStreamEvent(chunk)
 	case StreamToolInputStart:
 		idx := e.ensureToolIndex(part.ToolCallID)
 		e.toolNames[part.ToolCallID] = part.ToolName
 		e.toolInputs[part.ToolCallID] = ""
 		tc := openAIChatStreamToolCall{Index: idx, ID: part.ToolCallID, Type: "function", Function: openAIChatStreamToolCallFunction{Name: part.ToolName}}
-		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{ToolCalls: []openAIChatStreamToolCall{tc}}}}}
+		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{ToolCalls: []openAIChatStreamToolCall{tc}}}}}
 		return singleOpenAIChatStreamEvent(chunk)
 	case StreamToolInputDelta:
 		idx := e.ensureToolIndex(part.ToolCallID)
 		e.toolInputs[part.ToolCallID] += part.Delta
 		tc := openAIChatStreamToolCall{Index: idx, Function: openAIChatStreamToolCallFunction{Arguments: part.Delta}}
-		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{ToolCalls: []openAIChatStreamToolCall{tc}}}}}
+		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{ToolCalls: []openAIChatStreamToolCall{tc}}}}}
 		return singleOpenAIChatStreamEvent(chunk)
 	case StreamToolInputEnd:
 		return nil, nil
@@ -378,7 +396,7 @@ func (e *openAIChatStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent, err
 	case StreamError:
 		return e.encodeStreamError(part)
 	case StreamRaw:
-		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{Content: strPtr(fmt.Sprint(part.RawValue))}}}}
+		chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{Content: strPtr(fmt.Sprint(part.RawValue))}}}}
 		return singleOpenAIChatStreamEvent(chunk)
 	default:
 		return nil, nil
@@ -427,13 +445,13 @@ func (e *openAIChatStreamEncoder) encodeToolCall(part StreamPart) ([]RawStreamEv
 		return nil, err
 	}
 	var events []RawStreamEvent
-	startChunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{ToolCalls: []openAIChatStreamToolCall{{Index: idx, ID: toolID, Type: "function", Function: openAIChatStreamToolCallFunction{Name: name}}}}}}}
+	startChunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{ToolCalls: []openAIChatStreamToolCall{{Index: idx, ID: toolID, Type: "function", Function: openAIChatStreamToolCallFunction{Name: name}}}}}}}
 	start, err := singleOpenAIChatStreamEvent(startChunk)
 	if err != nil {
 		return nil, err
 	}
 	events = append(events, start...)
-	deltaChunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{ToolCalls: []openAIChatStreamToolCall{{Index: idx, Function: openAIChatStreamToolCallFunction{Arguments: input}}}}}}}
+	deltaChunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{ToolCalls: []openAIChatStreamToolCall{{Index: idx, Function: openAIChatStreamToolCallFunction{Arguments: input}}}}}}}
 	delta, err := singleOpenAIChatStreamEvent(deltaChunk)
 	if err != nil {
 		return nil, err
@@ -445,7 +463,7 @@ func (e *openAIChatStreamEncoder) encodeToolCall(part StreamPart) ([]RawStreamEv
 
 func (e *openAIChatStreamEncoder) encodeFinish(part StreamPart) ([]RawStreamEvent, error) {
 	reason := encodeOpenAIFinishReason(part.FinishReason)
-	chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: currentTimestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{}, FinishReason: &reason}}}
+	chunk := openAIChatStreamChunk{Object: "chat.completion.chunk", Model: e.model, Created: e.timestamp(), Choices: []openAIChatStreamChoice{{Index: 0, Delta: &openAIChatStreamDelta{}, FinishReason: &reason}}}
 	return singleOpenAIChatStreamEvent(chunk)
 }
 
@@ -458,7 +476,7 @@ func (e *openAIChatStreamEncoder) encodeUsageSummary() ([]RawStreamEvent, error)
 		ID:      e.responseID,
 		Object:  "chat.completion.chunk",
 		Model:   e.model,
-		Created: currentTimestamp(),
+		Created: e.timestamp(),
 		Choices: []openAIChatStreamChoice{},
 		Usage: &openAIChatStreamChunkUsage{
 			PromptTokens:            usage.PromptTokens,
@@ -505,10 +523,6 @@ func singleOpenAIChatStreamEvent(chunk openAIChatStreamChunk) ([]RawStreamEvent,
 		return nil, err
 	}
 	return []RawStreamEvent{{Data: raw}}, nil
-}
-
-func currentTimestamp() int64 {
-	return 0
 }
 
 func strPtr(s string) *string {

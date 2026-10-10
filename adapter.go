@@ -6,12 +6,22 @@ type EncodeRequestOptions struct {
 
 type EncodeResponseOptions struct {
 	Model string
+
+	// Created is the Unix timestamp in seconds to stamp on the response. Zero
+	// means "use the current time"; hosts that need deterministic output for
+	// snapshots or caching should set it.
+	Created int64
 }
 
 type StreamDecodeOptions struct{}
 
 type StreamEncodeOptions struct {
 	Model string
+
+	// Created is the Unix timestamp in seconds to stamp on every event of the
+	// stream. Zero means "stamp the first event and reuse that value", which is
+	// what a real provider does: one timestamp for the whole completion.
+	Created int64
 }
 
 type Adapter interface {
