@@ -1442,6 +1442,7 @@ type openAIResponsesAnnotation struct {
 
 type openAIResponsesStreamDecoder struct {
 	started           bool
+	finished          bool
 	activeTextID      string
 	activeReasoningID string
 	startedText       map[string]bool
@@ -1610,6 +1611,7 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 			return nil, nil
 		}
 	case "response.completed":
+		d.finished = true
 		parts := make([]StreamPart, 0, 2)
 		finish := StreamPart{Type: StreamFinish}
 		if raw.Response != nil {
@@ -1628,6 +1630,7 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 		parts = append(parts, finish)
 		return parts, nil
 	case "response.incomplete":
+		d.finished = true
 		parts := make([]StreamPart, 0, 2)
 		finish := StreamPart{Type: StreamFinish, FinishReason: FinishOther}
 		if raw.Response != nil {
@@ -1644,6 +1647,7 @@ func (d *openAIResponsesStreamDecoder) Decode(event RawStreamEvent) ([]StreamPar
 		parts = append(parts, finish)
 		return parts, nil
 	case "response.failed":
+		d.finished = true
 		return []StreamPart{{Type: StreamError, Error: responsesStreamError(raw)}}, nil
 	case "error":
 		return []StreamPart{{Type: StreamError, Error: responsesStreamError(raw)}}, nil
@@ -1873,7 +1877,10 @@ func (d *openAIResponsesStreamDecoder) clearActiveTool(itemID string) {
 }
 
 func (d *openAIResponsesStreamDecoder) Close() ([]StreamPart, error) {
-	return nil, nil
+	if !d.started || d.finished {
+		return nil, nil
+	}
+	return []StreamPart{{Type: StreamError, Error: truncatedStreamError()}}, nil
 }
 
 type openAIResponsesStreamEncoder struct {

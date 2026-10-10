@@ -239,7 +239,8 @@ type openAIChatStreamChunkUsage struct {
 }
 
 type openAIChatStreamDecoder struct {
-	started bool
+	started  bool
+	finished bool
 }
 
 func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, error) {
@@ -247,6 +248,9 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 		return nil, nil
 	}
 	if string(event.Data) == "[DONE]" {
+		// The sentinel is the provider saying the stream is over, whether or
+		// not it also sent a finish_reason.
+		d.finished = true
 		return nil, nil
 	}
 
@@ -296,6 +300,7 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 			}
 		}
 		if choice.FinishReason != nil && *choice.FinishReason != "" {
+			d.finished = true
 			parts = append(parts, StreamPart{Type: StreamFinish, FinishReason: decodeOpenAIFinishReason(*choice.FinishReason)})
 		}
 	}
@@ -317,7 +322,10 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 }
 
 func (d *openAIChatStreamDecoder) Close() ([]StreamPart, error) {
-	return nil, nil
+	if !d.started || d.finished {
+		return nil, nil
+	}
+	return []StreamPart{{Type: StreamError, Error: truncatedStreamError()}}, nil
 }
 
 type openAIChatStreamEncoder struct {

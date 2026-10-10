@@ -215,6 +215,8 @@ type anthropicStreamDecoder struct {
 	blockTypes map[int]StreamPartType
 	toolIDs    map[int]string
 	usage      Usage
+	started    bool
+	finished   bool
 }
 
 func (d *anthropicStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, error) {
@@ -226,6 +228,7 @@ func (d *anthropicStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, err
 	if err := json.Unmarshal(event.Data, &raw); err != nil {
 		return nil, fmt.Errorf("decode anthropic stream event: %w", err)
 	}
+	d.started = true
 
 	switch raw.Type {
 	case "message_start":
@@ -258,11 +261,17 @@ func (d *anthropicStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, err
 			usage = *raw.Usage
 		}
 		mergeUsage(&d.usage, decodeAnthropicUsage(usage))
+		if strings.TrimSpace(raw.Delta.StopReason) != "" {
+			d.finished = true
+		}
 		finish := StreamPart{Type: StreamFinish, FinishReason: decodeAnthropicStopReason(raw.Delta.StopReason), Usage: d.usage}
 		return []StreamPart{finish}, nil
 	case "message_stop":
+		d.finished = true
 		return nil, nil
 	case "error":
+		// A provider error is a deliberate end of the stream, not a truncation.
+		d.finished = true
 		return []StreamPart{{Type: StreamError, Error: raw.Error}}, nil
 	case "ping":
 		return nil, nil
@@ -272,7 +281,10 @@ func (d *anthropicStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, err
 }
 
 func (d *anthropicStreamDecoder) Close() ([]StreamPart, error) {
-	return nil, nil
+	if !d.started || d.finished {
+		return nil, nil
+	}
+	return []StreamPart{{Type: StreamError, Error: truncatedStreamError()}}, nil
 }
 
 func (d *anthropicStreamDecoder) setBlockType(index int, partType StreamPartType) {

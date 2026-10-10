@@ -1,5 +1,24 @@
 package protocolbridge
 
+import "errors"
+
+// ErrStreamTruncated reports an upstream stream that ended without a terminal
+// event: the provider's connection dropped mid-generation, or it closed the
+// stream without saying the response was finished.
+//
+// A decoder surfaces it as a StreamError part from Close. Without that, a
+// truncated upstream is indistinguishable from a short but successful answer,
+// because the encoder synthesizes a normal finish for any stream that merely
+// stops.
+var ErrStreamTruncated = errors.New("protocolbridge: upstream stream ended without a terminal event")
+
+// truncatedStreamError is the StreamError value a decoder emits for an
+// upstream that ended early. The keys are the ones the error readers use, so
+// every target protocol can render it.
+func truncatedStreamError() any {
+	return map[string]any{"code": "upstream_stream_truncated", "message": ErrStreamTruncated.Error()}
+}
+
 type RawStreamEvent struct {
 	Event string
 	Data  []byte
