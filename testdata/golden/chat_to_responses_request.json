@@ -1,0 +1,51 @@
+{
+  "input": [
+    {
+      "content": [
+        {
+          "text": "List the files in the working directory.",
+          "type": "input_text"
+        }
+      ],
+      "role": "user"
+    },
+    {
+      "arguments": "{\"command\":[\"bash\",\"-lc\",\"ls -1\"]}",
+      "call_id": "call_01ABC",
+      "name": "shell",
+      "status": "completed",
+      "type": "function_call"
+    },
+    {
+      "call_id": "call_01ABC",
+      "output": "README.md\nmain.go\n",
+      "type": "function_call_output"
+    }
+  ],
+  "instructions": "You are a coding agent running in a sandbox.",
+  "max_output_tokens": 4096,
+  "model": "upstream-model",
+  "stream": true,
+  "tool_choice": "auto",
+  "tools": [
+    {
+      "description": "Run a shell command.",
+      "name": "shell",
+      "parameters": {
+        "properties": {
+          "command": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      },
+      "type": "function"
+    }
+  ]
+}

@@ -472,8 +472,8 @@ func TestOpenAIChatStreamDecoder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Decode(finish) error = %v", err)
 	}
-	if len(parts) != 1 || parts[0].Type != StreamFinish || parts[0].FinishReason != FinishStop {
-		t.Fatalf("finish parts = %+v", parts)
+	if len(parts) != 2 || parts[0].Type != StreamTextEnd || parts[1].Type != StreamFinish || parts[1].FinishReason != FinishStop {
+		t.Fatalf("finish parts = %+v, want the message to end before the finish", parts)
 	}
 
 	parts, err = decoder.Decode(RawStreamEvent{Data: []byte("[DONE]")})
@@ -635,4 +635,85 @@ func TestOpenAIChatStreamEncoderToolCall(t *testing.T) {
 	if len(events) != 0 {
 		t.Fatalf("ToolInputEnd events should be empty = %+v", events)
 	}
+}
+
+// A chat upstream never marks a tool call complete, so the decoder has to end
+// one on the two signals that do arrive: finish_reason, or the [DONE] sentinel
+// for a provider that goes straight there. A client that only learns a call is
+// finished from StreamToolInputEnd — the Responses encoder appends the call to
+// response.completed.output on that part — otherwise drops the call entirely.
+func TestOpenAIChatStreamDecoderEndsToolCalls(t *testing.T) {
+	t.Run("finish reason ends the call before the finish", func(t *testing.T) {
+		decoder, err := NewOpenAIChatAdapter().NewStreamDecoder(StreamDecodeOptions{})
+		if err != nil {
+			t.Fatalf("NewStreamDecoder() error = %v", err)
+		}
+		if _, err := decoder.Decode(RawStreamEvent{Data: []byte(`{"id":"chatcmpl-1","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}`)}); err != nil {
+			t.Fatalf("Decode(tool start) error = %v", err)
+		}
+		if _, err := decoder.Decode(RawStreamEvent{Data: []byte(`{"id":"chatcmpl-1","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"SF\"}"}}]},"finish_reason":null}]}`)}); err != nil {
+			t.Fatalf("Decode(tool delta) error = %v", err)
+		}
+
+		parts, err := decoder.Decode(RawStreamEvent{Data: []byte(`{"id":"chatcmpl-1","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`)})
+		if err != nil {
+			t.Fatalf("Decode(finish) error = %v", err)
+		}
+		if len(parts) != 2 {
+			t.Fatalf("finish parts = %+v, want a tool end and a finish", parts)
+		}
+		if parts[0].Type != StreamToolInputEnd || parts[0].ToolCallID != "call_1" || parts[0].ToolName != "get_weather" {
+			t.Fatalf("parts[0] = %+v, want the tool end for call_1", parts[0])
+		}
+		if parts[1].Type != StreamFinish || parts[1].FinishReason != FinishToolCalls {
+			t.Fatalf("parts[1] = %+v, want the finish after the tool end", parts[1])
+		}
+
+		parts, err = decoder.Decode(RawStreamEvent{Data: []byte(`[DONE]`)})
+		if err != nil {
+			t.Fatalf("Decode(DONE) error = %v", err)
+		}
+		if len(parts) != 0 {
+			t.Fatalf("DONE parts = %+v, want the call already ended once", parts)
+		}
+	})
+
+	t.Run("a tool call ends the message that came before it", func(t *testing.T) {
+		decoder, err := NewOpenAIChatAdapter().NewStreamDecoder(StreamDecodeOptions{})
+		if err != nil {
+			t.Fatalf("NewStreamDecoder() error = %v", err)
+		}
+		if _, err := decoder.Decode(RawStreamEvent{Data: []byte(`{"id":"chatcmpl-3","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"content":"Listing."},"finish_reason":null}]}`)}); err != nil {
+			t.Fatalf("Decode(text) error = %v", err)
+		}
+
+		parts, err := decoder.Decode(RawStreamEvent{Data: []byte(`{"id":"chatcmpl-3","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_3","type":"function","function":{"name":"shell","arguments":""}}]},"finish_reason":null}]}`)})
+		if err != nil {
+			t.Fatalf("Decode(tool start) error = %v", err)
+		}
+		if len(parts) != 2 || parts[0].Type != StreamTextEnd || parts[1].Type != StreamToolInputStart {
+			t.Fatalf("tool start parts = %+v, want the message to end first", parts)
+		}
+	})
+
+	t.Run("the sentinel ends a call the upstream never finished", func(t *testing.T) {
+		decoder, err := NewOpenAIChatAdapter().NewStreamDecoder(StreamDecodeOptions{})
+		if err != nil {
+			t.Fatalf("NewStreamDecoder() error = %v", err)
+		}
+		if _, err := decoder.Decode(RawStreamEvent{Data: []byte(`{"id":"chatcmpl-2","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_2","type":"function","function":{"name":"shell","arguments":"{}"}}]},"finish_reason":null}]}`)}); err != nil {
+			t.Fatalf("Decode(tool start) error = %v", err)
+		}
+
+		parts, err := decoder.Decode(RawStreamEvent{Data: []byte(`[DONE]`)})
+		if err != nil {
+			t.Fatalf("Decode(DONE) error = %v", err)
+		}
+		if len(parts) != 1 || parts[0].Type != StreamToolInputEnd || parts[0].ToolCallID != "call_2" || parts[0].ToolName != "shell" {
+			t.Fatalf("DONE parts = %+v, want the tool end for call_2", parts)
+		}
+		if _, err := decoder.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	})
 }

@@ -3,6 +3,7 @@ package protocolbridge
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -309,7 +310,9 @@ func TestOpenAIResponsesEncodeRequestSkipsImageWithoutSource(t *testing.T) {
 	}
 }
 
-func TestOpenAIResponsesEncodeRequestRejectsStopSequences(t *testing.T) {
+// The Responses API has no stop field. The loss is reported rather than either
+// silently ignored or refused outright, so a host can choose.
+func TestOpenAIResponsesEncodeRequestReportsStopSequences(t *testing.T) {
 	adapter := NewOpenAIResponsesAdapter()
 	req := &LLMRequest{
 		Model:         "gpt-5.4",
@@ -317,8 +320,36 @@ func TestOpenAIResponsesEncodeRequestRejectsStopSequences(t *testing.T) {
 		StopSequences: []string{"END"},
 	}
 
-	if _, err := adapter.EncodeRequest(req, EncodeRequestOptions{Model: "upstream-gpt"}); err == nil {
-		t.Fatal("EncodeRequest() error = nil")
+	raw, err := adapter.EncodeRequest(req, EncodeRequestOptions{Model: "upstream-gpt"})
+	if err != nil {
+		t.Fatalf("EncodeRequest() error = %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if _, ok := decoded["stop"]; ok {
+		t.Fatalf("stop must not be invented: %+v", decoded["stop"])
+	}
+	if len(req.Warnings) != 1 {
+		t.Fatalf("warnings = %+v", req.Warnings)
+	}
+	warning := req.Warnings[0]
+	if warning.Code != LossDroppedStopSequences || warning.Severity != SeverityWarning || warning.Path != "stop_sequences" {
+		t.Fatalf("warning = %+v", warning)
+	}
+	if !strings.Contains(warning.Message, "END") {
+		t.Fatalf("warning message = %q", warning.Message)
+	}
+
+	// A host that cannot tolerate the loss can ask for a refusal instead.
+	strictReq := &LLMRequest{
+		Model:         "gpt-5.4",
+		Prompt:        []Message{{Role: RoleUser, Parts: []Part{{Type: PartText, Text: &TextPart{Text: "Hello"}}}}},
+		StopSequences: []string{"END"},
+	}
+	if _, err := adapter.EncodeRequest(strictReq, EncodeRequestOptions{Model: "upstream-gpt", LossPolicy: LossPolicyStrict}); err == nil {
+		t.Fatal("EncodeRequest() error = nil, want strict to refuse the dropped stop sequences")
 	}
 }
 
@@ -433,7 +464,9 @@ func TestOpenAIChatResponseFormatEncodesToOpenAIResponsesTextFormat(t *testing.T
 	}
 }
 
-func TestOpenAIChatStopSequencesRejectOpenAIResponsesEncode(t *testing.T) {
+// A chat client asking for stop sequences, served by a Responses upstream,
+// must hear about the loss whichever adapter does the encoding.
+func TestOpenAIChatStopSequencesAreReportedByOpenAIResponsesEncode(t *testing.T) {
 	chatAdapter := NewOpenAIChatAdapter()
 	responsesAdapter := NewOpenAIResponsesAdapter()
 	chatRaw := []byte(`{
@@ -446,8 +479,18 @@ func TestOpenAIChatStopSequencesRejectOpenAIResponsesEncode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Chat DecodeRequest() error = %v", err)
 	}
-	if _, err := responsesAdapter.EncodeRequest(req, EncodeRequestOptions{Model: "gpt-5.4"}); err == nil {
-		t.Fatal("Responses EncodeRequest() error = nil")
+	if _, err := responsesAdapter.EncodeRequest(req, EncodeRequestOptions{Model: "gpt-5.4"}); err != nil {
+		t.Fatalf("Responses EncodeRequest() error = %v", err)
+	}
+	if len(req.Warnings) != 1 || req.Warnings[0].Code != LossDroppedStopSequences {
+		t.Fatalf("warnings = %+v", req.Warnings)
+	}
+	if req.Warnings[0].From != ProtocolOpenAIChat || req.Warnings[0].To != ProtocolOpenAIResponses {
+		t.Fatalf("warning directions = %s -> %s", req.Warnings[0].From, req.Warnings[0].To)
+	}
+
+	if _, err := responsesAdapter.EncodeRequest(req, EncodeRequestOptions{Model: "gpt-5.4", LossPolicy: LossPolicyStrict}); err == nil {
+		t.Fatal("Responses EncodeRequest() error = nil, want strict to refuse")
 	}
 }
 

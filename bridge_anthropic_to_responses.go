@@ -43,6 +43,15 @@ func (b anthropicToOpenAIResponsesBridge) EncodeUpstreamRequest(req *LLMRequest,
 	}
 	encodeOpenAIResponsesState(&request, req.State)
 
+	recorder := newLossRecorder(req.Protocol, ProtocolOpenAIResponses)
+	if len(req.StopSequences) > 0 {
+		// This bridge builds the Responses request by hand, and the Responses
+		// API has no stop field to put these in.
+		recorder.report(LossDroppedStopSequences, "stop_sequences",
+			fmt.Sprintf("the Responses API has no stop field, so stop sequences %v were dropped and the model may generate past them", req.StopSequences),
+			SeverityWarning)
+	}
+
 	input := make([]openAIResponsesInputItem, 0)
 	for _, message := range req.Prompt {
 		switch message.Role {
@@ -56,6 +65,9 @@ func (b anthropicToOpenAIResponsesBridge) EncodeUpstreamRequest(req *LLMRequest,
 	}
 	request.Input = input
 
+	if err := recorder.attachTo(req, opts.LossPolicy); err != nil {
+		return nil, err
+	}
 	return json.Marshal(request)
 }
 
@@ -73,7 +85,7 @@ func (b anthropicToOpenAIResponsesBridge) NewStreamDecoder(opts StreamDecodeOpti
 }
 
 func (b anthropicToOpenAIResponsesBridge) NewStreamEncoder(opts StreamEncodeOptions) (StreamEncoder, error) {
-	return &openAIResponsesToAnthropicStreamEncoder{ant: anthropicStreamEncoder{model: opts.Model}}, nil
+	return &openAIResponsesToAnthropicStreamEncoder{ant: newAnthropicStreamEncoder(opts)}, nil
 }
 
 func anthropicBridgeInputItemsForMessage(message Message) []openAIResponsesInputItem {

@@ -618,14 +618,24 @@ func TestOpenAIResponsesToAnthropicBridgeOmitsUnsupportedReasoningEffortAndProvi
 	if _, ok := decoded["tools"]; ok {
 		t.Fatalf("provider-defined tools should be omitted for Anthropic requests: %+v", decoded["tools"])
 	}
-	systemBlocks := decoded["system"].([]any)
-	system := systemBlocks[0].(map[string]any)["text"].(string)
-	if system == "" || !containsString(system, "web_search_preview") {
-		t.Fatalf("system warning should mention omitted provider tool: %q", system)
+	// The tool is reported on the request, never written into the system prompt:
+	// doing that used to change what the model was asked about and invalidate the
+	// cached prefix on every turn.
+	if system, ok := decoded["system"].(string); ok && containsString(system, "web_search_preview") {
+		t.Fatalf("system prompt must not carry a proxy warning: %q", system)
+	}
+	if len(req.Warnings) != 1 {
+		t.Fatalf("warnings = %+v", req.Warnings)
+	}
+	if req.Warnings[0].Code != LossUnsupportedTool || req.Warnings[0].Severity != SeverityError {
+		t.Fatalf("warning = %+v", req.Warnings[0])
+	}
+	if req.Warnings[0].Path != "tools[0]" || !containsString(req.Warnings[0].Message, "web_search_preview") {
+		t.Fatalf("warning = %+v", req.Warnings[0])
 	}
 }
 
-func TestOpenAIResponsesToAnthropicBridgePreservesUnsupportedFileAsWarningText(t *testing.T) {
+func TestOpenAIResponsesToAnthropicBridgeReportsUnsupportedFile(t *testing.T) {
 	bridge, ok := NewCrossFamilyBridge(ProtocolOpenAIResponses, "anthropic")
 	if !ok {
 		t.Fatal("NewCrossFamilyBridge() ok = false, want true")
@@ -650,9 +660,14 @@ func TestOpenAIResponsesToAnthropicBridgePreservesUnsupportedFileAsWarningText(t
 	}
 	messages := decoded["messages"].([]any)
 	content := messages[0].(map[string]any)["content"].([]any)
-	warningBlock := content[0].(map[string]any)
-	if warningBlock["type"] != "text" || !containsString(warningBlock["text"].(string), "report.docx") {
-		t.Fatalf("unsupported file warning block = %+v", warningBlock)
+	if len(content) != 0 {
+		t.Fatalf("content = %+v, want the unsupported file dropped rather than rewritten as text", content)
+	}
+	if len(req.Warnings) != 1 || req.Warnings[0].Code != LossUnsupportedFileReference {
+		t.Fatalf("warnings = %+v", req.Warnings)
+	}
+	if !containsString(req.Warnings[0].Message, "report.docx") {
+		t.Fatalf("warning = %+v", req.Warnings[0])
 	}
 }
 
