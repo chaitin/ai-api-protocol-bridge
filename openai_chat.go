@@ -268,9 +268,83 @@ type openAIChatStreamChunkUsage struct {
 	CompletionTokensDetails *openAICompletionTokensDetails `json:"completion_tokens_details,omitempty"`
 }
 
+// openAIChatOpenToolCall is a tool call the upstream announced and has not
+// ended. Chat streams carry no end marker for a tool call: the argument deltas
+// simply stop and the stream moves on to finish_reason or the [DONE] sentinel.
+type openAIChatOpenToolCall struct {
+	Index int
+	ID    string
+	Name  string
+}
+
 type openAIChatStreamDecoder struct {
-	started  bool
-	finished bool
+	started       bool
+	finished      bool
+	textOpen      bool
+	textIndex     int
+	openToolCalls []openAIChatOpenToolCall
+}
+
+// closeOpenText ends the message the stream is still writing. A chat upstream
+// has no text-end event either: the content deltas stop and the next chunk is
+// a tool call or a finish_reason. An encoder that appends the message to the
+// completed response only there — the Responses encoder does — otherwise
+// publishes a response whose output holds everything except the answer.
+func (d *openAIChatStreamDecoder) closeOpenText() []StreamPart {
+	if !d.textOpen {
+		return nil
+	}
+	d.textOpen = false
+	return []StreamPart{{Type: StreamTextEnd, ID: streamIndexID(d.textIndex)}}
+}
+
+// closeOpenContent ends everything the upstream left open, in the order it
+// produced them, so a client reconstructing items from the ends sees the same
+// order the upstream wrote.
+func (d *openAIChatStreamDecoder) closeOpenContent() []StreamPart {
+	parts := d.closeOpenText()
+	return append(parts, d.closeOpenToolCalls()...)
+}
+
+// openToolCall remembers the tool call a start chunk announced, in the index
+// order the upstream used. A repeated announcement for one index updates the
+// fields the first chunk left empty rather than opening a second call.
+func (d *openAIChatStreamDecoder) openToolCall(index int, id, name string) {
+	for i := range d.openToolCalls {
+		if d.openToolCalls[i].Index != index {
+			continue
+		}
+		if id != "" {
+			d.openToolCalls[i].ID = id
+		}
+		if name != "" {
+			d.openToolCalls[i].Name = name
+		}
+		return
+	}
+	d.openToolCalls = append(d.openToolCalls, openAIChatOpenToolCall{Index: index, ID: id, Name: name})
+}
+
+// closeOpenToolCalls ends every tool call the upstream left open, in the order
+// the upstream opened them.
+//
+// A client that reads StreamToolInputEnd is the only thing that can tell a
+// finished tool call from one the upstream abandoned: the Responses encoder
+// appends the call to response.completed.output there, so a stream that never
+// ends one publishes a tool call the client drops instead of running.
+func (d *openAIChatStreamDecoder) closeOpenToolCalls() []StreamPart {
+	open := d.openToolCalls
+	d.openToolCalls = nil
+	parts := make([]StreamPart, 0, len(open))
+	for _, call := range open {
+		parts = append(parts, StreamPart{
+			Type:       StreamToolInputEnd,
+			ID:         streamIndexID(call.Index),
+			ToolCallID: call.ID,
+			ToolName:   call.Name,
+		})
+	}
+	return parts
 }
 
 func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, error) {
@@ -279,9 +353,11 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 	}
 	if string(event.Data) == "[DONE]" {
 		// The sentinel is the provider saying the stream is over, whether or
-		// not it also sent a finish_reason.
+		// not it also sent a finish_reason. A provider that sent one has
+		// already ended its tool calls, so this is the fallback for a stream
+		// that goes straight to the sentinel.
 		d.finished = true
-		return nil, nil
+		return d.closeOpenContent(), nil
 	}
 
 	var chunk openAIChatStreamChunk
@@ -323,6 +399,8 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 			parts = append(parts, StreamPart{Type: StreamReasoningDelta, ID: streamIndexID(choice.Index), Delta: *choice.Delta.Reasoning})
 		}
 		if choice.Delta.Content != nil && *choice.Delta.Content != "" {
+			d.textOpen = true
+			d.textIndex = choice.Index
 			parts = append(parts, StreamPart{Type: StreamTextDelta, ID: streamIndexID(choice.Index), Delta: *choice.Delta.Content})
 		}
 		if choice.Delta.Refusal != nil && *choice.Delta.Refusal != "" {
@@ -330,6 +408,10 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 		}
 		for _, tc := range choice.Delta.ToolCalls {
 			if tc.ID != "" {
+				// The message comes first in the item order, so it has to end
+				// before the function call opens its own output item.
+				parts = append(parts, d.closeOpenText()...)
+				d.openToolCall(tc.Index, tc.ID, tc.Function.Name)
 				parts = append(parts, StreamPart{Type: StreamToolInputStart, ID: streamIndexID(tc.Index), ToolCallID: tc.ID, ToolName: tc.Function.Name})
 			}
 			if tc.Function.Arguments != "" {
@@ -338,6 +420,9 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 		}
 		if choice.FinishReason != nil && *choice.FinishReason != "" {
 			d.finished = true
+			// The tool-call phase is over: the upstream said why it stopped,
+			// and no later chunk can add to a call it has already made.
+			parts = append(parts, d.closeOpenContent()...)
 			parts = append(parts, StreamPart{Type: StreamFinish, FinishReason: decodeOpenAIFinishReason(*choice.FinishReason)})
 		}
 	}

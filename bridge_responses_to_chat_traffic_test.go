@@ -429,3 +429,144 @@ func TestResponsesToChatBridgeDecodesChatToolCall(t *testing.T) {
 		t.Fatalf("function_call = %+v", call)
 	}
 }
+
+// The streaming half of the codex tool-call path. A chat upstream streams a
+// function call and then reports usage in a chunk of its own, after
+// finish_reason. codex only runs a call it finds in response.completed.output,
+// and the Responses encoder appends one there on StreamToolInputEnd — which a
+// chat stream never sends. The bridge therefore has to end the call itself and
+// still hold the completion for the usage that arrives afterwards.
+func TestResponsesToChatBridgeEndsStreamedChatToolCall(t *testing.T) {
+	events := relayChatStreamToResponses(t, []string{
+		`{"id":"chatcmpl-7","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-7","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[{"index":0,"delta":{"content":"Listing the directory."},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-7","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_7","type":"function","function":{"name":"shell","arguments":""}}]},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-7","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":[\"ls\"]}"}}]},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-7","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		`{"id":"chatcmpl-7","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[],"usage":{"prompt_tokens":30,"completion_tokens":7,"total_tokens":37}}`,
+		`[DONE]`,
+	})
+
+	order := make([]string, 0, len(events))
+	for _, event := range events {
+		order = append(order, event.Event)
+	}
+	indexOf := func(eventType string) int {
+		for i, name := range order {
+			if name == eventType {
+				return i
+			}
+		}
+		return -1
+	}
+
+	argumentsAt := indexOf("response.function_call_arguments.done")
+	if argumentsAt < 0 {
+		t.Fatalf("no response.function_call_arguments.done in %v", order)
+	}
+	itemAt := indexOf("response.output_item.done")
+	if itemAt < 0 {
+		t.Fatalf("no response.output_item.done in %v", order)
+	}
+	completedAt := indexOf("response.completed")
+	if completedAt < 0 {
+		t.Fatalf("no response.completed in %v", order)
+	}
+	if argumentsAt > completedAt || itemAt > completedAt {
+		t.Fatalf("the call is ended after the response completed: %v", order)
+	}
+
+	var arguments map[string]any
+	if err := json.Unmarshal(events[argumentsAt].Data, &arguments); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if arguments["arguments"] != `{"command":["ls"]}` {
+		t.Fatalf("arguments = %#v", arguments["arguments"])
+	}
+
+	// response.output_item.done is emitted for the message too; the function
+	// call is the one that matters here.
+	var call map[string]any
+	for _, event := range events {
+		if event.Event != "response.output_item.done" {
+			continue
+		}
+		var done map[string]any
+		if err := json.Unmarshal(event.Data, &done); err != nil {
+			t.Fatalf("Unmarshal() error = %v", err)
+		}
+		item, _ := done["item"].(map[string]any)
+		if item != nil && item["type"] == "function_call" {
+			call = item
+		}
+	}
+	if call == nil {
+		t.Fatalf("no function_call item was ever completed: %v", order)
+	}
+	if call["call_id"] != "call_7" || call["name"] != "shell" || call["arguments"] != `{"command":["ls"]}` {
+		t.Fatalf("function_call item = %+v", call)
+	}
+
+	// The call has to reach the client that reads only the completed response.
+	var completed map[string]any
+	if err := json.Unmarshal(events[completedAt].Data, &completed); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	response := completed["response"].(map[string]any)
+	output, _ := response["output"].([]any)
+	var bridged map[string]any
+	for _, entry := range output {
+		item, _ := entry.(map[string]any)
+		if item != nil && item["type"] == "function_call" {
+			bridged = item
+		}
+	}
+	if bridged == nil {
+		t.Fatalf("response.completed.output carries no function_call: %+v", response["output"])
+	}
+	if bridged["call_id"] != "call_7" || bridged["name"] != "shell" || bridged["arguments"] != `{"command":["ls"]}` {
+		t.Fatalf("completed function_call = %+v", bridged)
+	}
+
+	// Ending the call must not cost the usage the finish was held for.
+	usage, ok := response["usage"].(map[string]any)
+	if !ok || usage["input_tokens"] != float64(30) || usage["output_tokens"] != float64(7) {
+		t.Fatalf("usage = %#v", response["usage"])
+	}
+
+	// The message the upstream wrote before the call is an output item too, and
+	// it has to come first: an item takes the output index it is appended at,
+	// so two items open at once both claim index 0.
+	if indexOf("response.output_text.done") < 0 {
+		t.Fatalf("the message was never ended: %v", order)
+	}
+	if len(output) != 2 {
+		t.Fatalf("response.completed.output = %+v, want the message and the call", output)
+	}
+	first, _ := output[0].(map[string]any)
+	second, _ := output[1].(map[string]any)
+	if first["type"] != "message" || second["type"] != "function_call" {
+		t.Fatalf("output order = %+v", output)
+	}
+
+	indices := map[string]int{}
+	for _, event := range events {
+		if event.Event != "response.output_item.added" {
+			continue
+		}
+		var added map[string]any
+		if err := json.Unmarshal(event.Data, &added); err != nil {
+			t.Fatalf("Unmarshal() error = %v", err)
+		}
+		item, _ := added["item"].(map[string]any)
+		kind, _ := item["type"].(string)
+		index, _ := added["output_index"].(float64)
+		if previous, seen := indices[kind]; seen && previous != int(index) {
+			t.Fatalf("%s announced at two output indexes: %d then %d", kind, previous, int(index))
+		}
+		indices[kind] = int(index)
+	}
+	if indices["message"] != 0 || indices["function_call"] != 1 {
+		t.Fatalf("output indexes = %+v, want the message at 0 and the call at 1", indices)
+	}
+}
