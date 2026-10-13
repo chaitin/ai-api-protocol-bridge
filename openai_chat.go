@@ -278,11 +278,27 @@ type openAIChatOpenToolCall struct {
 }
 
 type openAIChatStreamDecoder struct {
-	started       bool
-	finished      bool
-	textOpen      bool
-	textIndex     int
-	openToolCalls []openAIChatOpenToolCall
+	started        bool
+	finished       bool
+	reasoningOpen  bool
+	reasoningIndex int
+	textOpen       bool
+	textIndex      int
+	openToolCalls  []openAIChatOpenToolCall
+}
+
+// closeOpenReasoning ends the reasoning block the stream is still writing. A
+// chat upstream has no reasoning-end event either: the reasoning_content deltas
+// stop and the next chunk is content or a tool call. An encoder that appends the
+// item to the completed response only there — the Responses encoder does —
+// otherwise drops thoughts the client already read, and one that opens a block
+// per start is left with a block nothing ever closes.
+func (d *openAIChatStreamDecoder) closeOpenReasoning() []StreamPart {
+	if !d.reasoningOpen {
+		return nil
+	}
+	d.reasoningOpen = false
+	return []StreamPart{{Type: StreamReasoningEnd, ID: streamIndexID(d.reasoningIndex)}}
 }
 
 // closeOpenText ends the message the stream is still writing. A chat upstream
@@ -300,16 +316,25 @@ func (d *openAIChatStreamDecoder) closeOpenText() []StreamPart {
 
 // closeOpenContent ends everything the upstream left open, in the order it
 // produced them, so a client reconstructing items from the ends sees the same
-// order the upstream wrote.
+// order the upstream wrote: the reasoning a chat model writes before its answer,
+// then the message, then the calls.
 func (d *openAIChatStreamDecoder) closeOpenContent() []StreamPart {
-	parts := d.closeOpenText()
+	parts := d.closeOpenReasoning()
+	parts = append(parts, d.closeOpenText()...)
 	return append(parts, d.closeOpenToolCalls()...)
 }
 
 // openToolCall remembers the tool call a start chunk announced, in the index
 // order the upstream used. A repeated announcement for one index updates the
-// fields the first chunk left empty rather than opening a second call.
-func (d *openAIChatStreamDecoder) openToolCall(index int, id, name string) {
+// fields the first chunk left empty rather than opening a second call, and
+// reports whether this was a new call.
+//
+// The caller needs that answer: a StreamToolInputStart is what makes an encoder
+// open an output item, and only closeOpenToolCalls ends one. Emitting a second
+// Start for an index already open leaves the first item incomplete forever —
+// the Responses encoder also resets the arguments already streamed to it — so
+// the Start belongs to the announcement that actually opened the call.
+func (d *openAIChatStreamDecoder) openToolCall(index int, id, name string) bool {
 	for i := range d.openToolCalls {
 		if d.openToolCalls[i].Index != index {
 			continue
@@ -320,9 +345,10 @@ func (d *openAIChatStreamDecoder) openToolCall(index int, id, name string) {
 		if name != "" {
 			d.openToolCalls[i].Name = name
 		}
-		return
+		return false
 	}
 	d.openToolCalls = append(d.openToolCalls, openAIChatOpenToolCall{Index: index, ID: id, Name: name})
+	return true
 }
 
 // closeOpenToolCalls ends every tool call the upstream left open, in the order
@@ -396,23 +422,50 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 			continue
 		}
 		if choice.Delta.Reasoning != nil && *choice.Delta.Reasoning != "" {
+			// A chat upstream has no reasoning-start event either: the first
+			// reasoning_content delta is where the block begins. An encoder
+			// opens the block a client reads deltas into on the start, and the
+			// Responses encoder only appends the item to the completed response
+			// on the end, so a bare delta left an Anthropic client with a
+			// thinking_delta for an index nothing announced and a Responses
+			// client with reasoning its output never carries.
+			parts = append(parts, d.closeOpenText()...)
+			if !d.reasoningOpen {
+				d.reasoningOpen = true
+				d.reasoningIndex = choice.Index
+				parts = append(parts, StreamPart{Type: StreamReasoningStart, ID: streamIndexID(choice.Index)})
+			}
 			parts = append(parts, StreamPart{Type: StreamReasoningDelta, ID: streamIndexID(choice.Index), Delta: *choice.Delta.Reasoning})
 		}
 		if choice.Delta.Content != nil && *choice.Delta.Content != "" {
+			// Reasoning comes before content in the item order, so it has to end
+			// before the message opens its own block.
+			parts = append(parts, d.closeOpenReasoning()...)
 			d.textOpen = true
 			d.textIndex = choice.Index
 			parts = append(parts, StreamPart{Type: StreamTextDelta, ID: streamIndexID(choice.Index), Delta: *choice.Delta.Content})
 		}
 		if choice.Delta.Refusal != nil && *choice.Delta.Refusal != "" {
+			// A refusal is text like any other: the client accumulates it as a
+			// text delta and an encoder appends the item to the completed
+			// response on StreamTextEnd. Leaving it out of the open-text state
+			// is what makes an encoder that waits for the end publish a refusal
+			// the completed response does not carry.
+			parts = append(parts, d.closeOpenReasoning()...)
+			d.textOpen = true
+			d.textIndex = choice.Index
 			parts = append(parts, StreamPart{Type: StreamTextDelta, ID: streamIndexID(choice.Index), Delta: *choice.Delta.Refusal, ProviderMetadata: map[string]any{"refusal": true}})
 		}
 		for _, tc := range choice.Delta.ToolCalls {
 			if tc.ID != "" {
-				// The message comes first in the item order, so it has to end
-				// before the function call opens its own output item.
+				// The message comes first in the item order — its reasoning and
+				// its text — so both have to end before the function call opens
+				// its own output item.
+				parts = append(parts, d.closeOpenReasoning()...)
 				parts = append(parts, d.closeOpenText()...)
-				d.openToolCall(tc.Index, tc.ID, tc.Function.Name)
-				parts = append(parts, StreamPart{Type: StreamToolInputStart, ID: streamIndexID(tc.Index), ToolCallID: tc.ID, ToolName: tc.Function.Name})
+				if d.openToolCall(tc.Index, tc.ID, tc.Function.Name) {
+					parts = append(parts, StreamPart{Type: StreamToolInputStart, ID: streamIndexID(tc.Index), ToolCallID: tc.ID, ToolName: tc.Function.Name})
+				}
 			}
 			if tc.Function.Arguments != "" {
 				parts = append(parts, StreamPart{Type: StreamToolInputDelta, ID: streamIndexID(tc.Index), ToolCallID: tc.ID, Delta: tc.Function.Arguments})
