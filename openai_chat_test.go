@@ -716,4 +716,82 @@ func TestOpenAIChatStreamDecoderEndsToolCalls(t *testing.T) {
 			t.Fatalf("Close() error = %v", err)
 		}
 	})
+
+	t.Run("a repeated announcement opens the call once", func(t *testing.T) {
+		decoder, err := NewOpenAIChatAdapter().NewStreamDecoder(StreamDecodeOptions{})
+		if err != nil {
+			t.Fatalf("NewStreamDecoder() error = %v", err)
+		}
+		// Some providers repeat the whole announcement, id and name included,
+		// before the argument deltas arrive. The call is already open, so a
+		// second StreamToolInputStart would open a second output item that
+		// nothing ever completes — and the Responses encoder resets the
+		// arguments it has already streamed on every Start.
+		announcement := `{"id":"chatcmpl-4","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_4","type":"function","function":{"name":"shell","arguments":""}}]},"finish_reason":null}]}`
+		countStarts := func(parts []StreamPart) int {
+			starts := 0
+			for _, part := range parts {
+				if part.Type == StreamToolInputStart {
+					starts++
+				}
+			}
+			return starts
+		}
+
+		parts, err := decoder.Decode(RawStreamEvent{Data: []byte(announcement)})
+		if err != nil {
+			t.Fatalf("Decode(first announcement) error = %v", err)
+		}
+		if starts := countStarts(parts); starts != 1 {
+			t.Fatalf("first announcement opened %d tool calls, want 1: %+v", starts, parts)
+		}
+
+		parts, err = decoder.Decode(RawStreamEvent{Data: []byte(announcement)})
+		if err != nil {
+			t.Fatalf("Decode(repeated announcement) error = %v", err)
+		}
+		if starts := countStarts(parts); starts != 0 {
+			t.Fatalf("repeated announcement opened %d tool calls, want 0: %+v", starts, parts)
+		}
+
+		parts, err = decoder.Decode(RawStreamEvent{Data: []byte(`{"id":"chatcmpl-4","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`)})
+		if err != nil {
+			t.Fatalf("Decode(finish) error = %v", err)
+		}
+		if len(parts) != 2 || parts[0].Type != StreamToolInputEnd || parts[0].ToolCallID != "call_4" {
+			t.Fatalf("finish parts = %+v, want exactly one tool end and a finish", parts)
+		}
+	})
+}
+
+// A refusal is an answer like any other: it arrives as a text delta and the
+// client accumulates it as text. Leaving it out of the decoder's open-text
+// state is what makes a refusal-only stream complete with no message at all,
+// because the Responses encoder appends the item to response.completed.output
+// only on StreamTextEnd.
+func TestOpenAIChatStreamDecoderEndsRefusalText(t *testing.T) {
+	decoder, err := NewOpenAIChatAdapter().NewStreamDecoder(StreamDecodeOptions{})
+	if err != nil {
+		t.Fatalf("NewStreamDecoder() error = %v", err)
+	}
+
+	parts, err := decoder.Decode(RawStreamEvent{Data: []byte(`{"id":"chatcmpl-5","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"refusal":"I cannot help with that."},"finish_reason":null}]}`)})
+	if err != nil {
+		t.Fatalf("Decode(refusal) error = %v", err)
+	}
+	// The chunk also opens the stream, so the delta is the second part.
+	if len(parts) != 2 || parts[0].Type != StreamStart || parts[1].Type != StreamTextDelta || parts[1].Delta != "I cannot help with that." {
+		t.Fatalf("refusal parts = %+v, want the stream start and one text delta", parts)
+	}
+	if refusal, _ := parts[1].ProviderMetadata["refusal"].(bool); !refusal {
+		t.Fatalf("refusal metadata = %+v, want refusal=true", parts[1].ProviderMetadata)
+	}
+
+	parts, err = decoder.Decode(RawStreamEvent{Data: []byte(`{"id":"chatcmpl-5","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`)})
+	if err != nil {
+		t.Fatalf("Decode(finish) error = %v", err)
+	}
+	if len(parts) != 2 || parts[0].Type != StreamTextEnd || parts[1].Type != StreamFinish {
+		t.Fatalf("finish parts = %+v, want the refusal text to end before the finish", parts)
+	}
 }

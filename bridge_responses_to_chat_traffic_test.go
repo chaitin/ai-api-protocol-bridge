@@ -570,3 +570,105 @@ func TestResponsesToChatBridgeEndsStreamedChatToolCall(t *testing.T) {
 		t.Fatalf("output indexes = %+v, want the message at 0 and the call at 1", indices)
 	}
 }
+
+// A provider that repeats the whole tool-call announcement — id and name
+// included — must not cost the call. The decoder opens one call per index, so
+// the client sees one output item open, and the arguments streamed before the
+// repeat survive: the Responses encoder resets its accumulator on every
+// StreamToolInputStart, so a second Start would drop them and leave the first
+// item open forever.
+func TestResponsesToChatBridgeKeepsArgumentsAcrossARepeatedToolAnnouncement(t *testing.T) {
+	events := relayChatStreamToResponses(t, []string{
+		`{"id":"chatcmpl-8","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[{"index":0,"delta":{"content":"Listing the directory."},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-8","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_8","type":"function","function":{"name":"shell","arguments":""}}]},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-8","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":"}}]},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-8","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_8","type":"function","function":{"name":"shell"}}]},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-8","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"[\"ls\"]}"}}]},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-8","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		`{"id":"chatcmpl-8","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[],"usage":{"prompt_tokens":30,"completion_tokens":7,"total_tokens":37}}`,
+		`[DONE]`,
+	})
+
+	added, done := 0, 0
+	var call map[string]any
+	for _, event := range events {
+		if event.Event != "response.output_item.added" && event.Event != "response.output_item.done" {
+			continue
+		}
+		var envelope map[string]any
+		if err := json.Unmarshal(event.Data, &envelope); err != nil {
+			t.Fatalf("Unmarshal() error = %v", err)
+		}
+		item, _ := envelope["item"].(map[string]any)
+		if item == nil || item["type"] != "function_call" {
+			continue
+		}
+		if event.Event == "response.output_item.added" {
+			added++
+			continue
+		}
+		done++
+		call = item
+	}
+	if added != 1 || done != 1 {
+		t.Fatalf("function_call items: added=%d done=%d, want one of each", added, done)
+	}
+	if call["call_id"] != "call_8" || call["name"] != "shell" || call["arguments"] != `{"command":["ls"]}` {
+		t.Fatalf("function_call item = %+v, want the arguments streamed before the repeat", call)
+	}
+}
+
+// A refusal-only stream is still an answer the completed response has to carry.
+// The decoder used to leave a refusal out of its open-text state, so no
+// StreamTextEnd followed and response.completed.output came back empty: the
+// client saw no answer at all, the same failure this branch fixes for content.
+func TestResponsesToChatBridgeEndsRefusalText(t *testing.T) {
+	events := relayChatStreamToResponses(t, []string{
+		`{"id":"chatcmpl-9","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[{"index":0,"delta":{"refusal":"I cannot help with that."},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-9","object":"chat.completion.chunk","created":1,"model":"gpt-5.4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		`[DONE]`,
+	})
+
+	names := make([]string, 0, len(events))
+	for _, event := range events {
+		names = append(names, event.Event)
+	}
+	doneAt := -1
+	completedAt := -1
+	for i, name := range names {
+		switch name {
+		case "response.output_text.done":
+			doneAt = i
+		case "response.completed":
+			completedAt = i
+		}
+	}
+	if doneAt < 0 {
+		t.Fatalf("the refusal text was never ended: %v", names)
+	}
+	if completedAt < 0 {
+		t.Fatalf("no response.completed in %v", names)
+	}
+	if doneAt > completedAt {
+		t.Fatalf("the refusal text ends after the response completed: %v", names)
+	}
+
+	var completed map[string]any
+	if err := json.Unmarshal(events[completedAt].Data, &completed); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	response := completed["response"].(map[string]any)
+	output, _ := response["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("response.completed.output = %+v, want the refusal message", output)
+	}
+	message, _ := output[0].(map[string]any)
+	content, _ := message["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("message content = %+v", content)
+	}
+	part, _ := content[0].(map[string]any)
+	if part["text"] != "I cannot help with that." {
+		t.Fatalf("refusal text = %#v, want the text the upstream sent", part["text"])
+	}
+}

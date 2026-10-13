@@ -308,8 +308,15 @@ func (d *openAIChatStreamDecoder) closeOpenContent() []StreamPart {
 
 // openToolCall remembers the tool call a start chunk announced, in the index
 // order the upstream used. A repeated announcement for one index updates the
-// fields the first chunk left empty rather than opening a second call.
-func (d *openAIChatStreamDecoder) openToolCall(index int, id, name string) {
+// fields the first chunk left empty rather than opening a second call, and
+// reports whether this was a new call.
+//
+// The caller needs that answer: a StreamToolInputStart is what makes an encoder
+// open an output item, and only closeOpenToolCalls ends one. Emitting a second
+// Start for an index already open leaves the first item incomplete forever —
+// the Responses encoder also resets the arguments already streamed to it — so
+// the Start belongs to the announcement that actually opened the call.
+func (d *openAIChatStreamDecoder) openToolCall(index int, id, name string) bool {
 	for i := range d.openToolCalls {
 		if d.openToolCalls[i].Index != index {
 			continue
@@ -320,9 +327,10 @@ func (d *openAIChatStreamDecoder) openToolCall(index int, id, name string) {
 		if name != "" {
 			d.openToolCalls[i].Name = name
 		}
-		return
+		return false
 	}
 	d.openToolCalls = append(d.openToolCalls, openAIChatOpenToolCall{Index: index, ID: id, Name: name})
+	return true
 }
 
 // closeOpenToolCalls ends every tool call the upstream left open, in the order
@@ -404,6 +412,13 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 			parts = append(parts, StreamPart{Type: StreamTextDelta, ID: streamIndexID(choice.Index), Delta: *choice.Delta.Content})
 		}
 		if choice.Delta.Refusal != nil && *choice.Delta.Refusal != "" {
+			// A refusal is text like any other: the client accumulates it as a
+			// text delta and an encoder appends the item to the completed
+			// response on StreamTextEnd. Leaving it out of the open-text state
+			// is what makes an encoder that waits for the end publish a refusal
+			// the completed response does not carry.
+			d.textOpen = true
+			d.textIndex = choice.Index
 			parts = append(parts, StreamPart{Type: StreamTextDelta, ID: streamIndexID(choice.Index), Delta: *choice.Delta.Refusal, ProviderMetadata: map[string]any{"refusal": true}})
 		}
 		for _, tc := range choice.Delta.ToolCalls {
@@ -411,8 +426,9 @@ func (d *openAIChatStreamDecoder) Decode(event RawStreamEvent) ([]StreamPart, er
 				// The message comes first in the item order, so it has to end
 				// before the function call opens its own output item.
 				parts = append(parts, d.closeOpenText()...)
-				d.openToolCall(tc.Index, tc.ID, tc.Function.Name)
-				parts = append(parts, StreamPart{Type: StreamToolInputStart, ID: streamIndexID(tc.Index), ToolCallID: tc.ID, ToolName: tc.Function.Name})
+				if d.openToolCall(tc.Index, tc.ID, tc.Function.Name) {
+					parts = append(parts, StreamPart{Type: StreamToolInputStart, ID: streamIndexID(tc.Index), ToolCallID: tc.ID, ToolName: tc.Function.Name})
+				}
 			}
 			if tc.Function.Arguments != "" {
 				parts = append(parts, StreamPart{Type: StreamToolInputDelta, ID: streamIndexID(tc.Index), ToolCallID: tc.ID, Delta: tc.Function.Arguments})
