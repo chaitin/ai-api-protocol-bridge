@@ -2,6 +2,7 @@ package protocolbridge
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -291,5 +292,151 @@ func TestAnthropicToOpenAIChatBridgeOpensAndClosesTextBlocks(t *testing.T) {
 		if order[i] != want[i] {
 			t.Fatalf("events = %v, want %v", order, want)
 		}
+	}
+}
+
+// A chat upstream reports reasoning as bare reasoning_content deltas, so an
+// Anthropic client is never told where the thinking block begins or ends.
+// Anthropic opens every block before streaming into it, so both halves have to
+// come from here: a client otherwise reads thinking_delta for an index nothing
+// announced and, since the decoder ends the reasoning, a content_block_stop for
+// a block that never opened.
+func TestAnthropicToOpenAIChatBridgeOpensAndClosesThinkingBlocks(t *testing.T) {
+	bridge, ok := NewCrossFamilyBridgeForProtocol(ProtocolAnthropicMessages, ProtocolOpenAIChat)
+	if !ok {
+		t.Fatal("NewCrossFamilyBridgeForProtocol(anthropic_messages, openai_chat) ok = false, want true")
+	}
+	decoder, err := bridge.NewStreamDecoder(StreamDecodeOptions{})
+	if err != nil {
+		t.Fatalf("NewStreamDecoder() error = %v", err)
+	}
+	encoder, err := bridge.NewStreamEncoder(StreamEncodeOptions{Model: "claude"})
+	if err != nil {
+		t.Fatalf("NewStreamEncoder() error = %v", err)
+	}
+
+	type frame struct {
+		event    string
+		index    float64
+		hasIndex bool
+		block    string
+		delta    string
+	}
+	frames := make([]frame, 0, 12)
+	record := func(event RawStreamEvent) {
+		t.Helper()
+		var payload map[string]any
+		if err := json.Unmarshal(event.Data, &payload); err != nil {
+			t.Fatalf("Unmarshal(%s) error = %v", event.Event, err)
+		}
+		current := frame{event: event.Event}
+		if index, ok := payload["index"].(float64); ok {
+			current.index, current.hasIndex = index, true
+		}
+		if block, ok := payload["content_block"].(map[string]any); ok {
+			current.block, _ = block["type"].(string)
+		}
+		if delta, ok := payload["delta"].(map[string]any); ok {
+			current.delta, _ = delta["type"].(string)
+		}
+		frames = append(frames, current)
+	}
+	consume := func(parts []StreamPart) {
+		t.Helper()
+		for _, part := range parts {
+			events, err := encoder.Encode(part)
+			if err != nil {
+				t.Fatalf("Encode(%s) error = %v", part.Type, err)
+			}
+			for _, event := range events {
+				record(event)
+			}
+		}
+	}
+
+	for _, chunk := range []string{
+		`{"id":"chatcmpl-a","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Let me think. "},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-a","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"reasoning_content":"Two plus two."},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-a","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"content":"Four."},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-a","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		`[DONE]`,
+	} {
+		parts, err := decoder.Decode(chatStreamChunk(t, chunk))
+		if err != nil {
+			t.Fatalf("Decode(%s) error = %v", chunk, err)
+		}
+		consume(parts)
+	}
+	closed, err := decoder.Close()
+	if err != nil {
+		t.Fatalf("decoder Close() error = %v", err)
+	}
+	consume(closed)
+	tail, err := encoder.Close()
+	if err != nil {
+		t.Fatalf("encoder Close() error = %v", err)
+	}
+	for _, event := range tail {
+		record(event)
+	}
+
+	// The thinking block must be announced first, carry the streamed deltas, and
+	// be stopped once.
+	thinkingAt := -1
+	for i, current := range frames {
+		if current.event == "content_block_start" && current.block == "thinking" {
+			thinkingAt = i
+			break
+		}
+	}
+	if thinkingAt < 0 {
+		t.Fatalf("no thinking content_block_start in %+v", frames)
+	}
+	thinkingIndex := frames[thinkingAt].index
+	var thinkingDeltas strings.Builder
+	stops := 0
+	for _, current := range frames[thinkingAt:] {
+		if !current.hasIndex || current.index != thinkingIndex {
+			continue
+		}
+		switch current.event {
+		case "content_block_start":
+			if current != frames[thinkingAt] {
+				t.Fatalf("the thinking index was started twice: %+v", frames)
+			}
+		case "content_block_delta":
+			if current.delta != "thinking_delta" {
+				t.Fatalf("delta on the thinking index = %q, want thinking_delta", current.delta)
+			}
+			thinkingDeltas.WriteString(".")
+		case "content_block_stop":
+			stops++
+		default:
+			t.Fatalf("unexpected event on the thinking index: %+v", current)
+		}
+	}
+	if thinkingDeltas.Len() != 2 {
+		t.Fatalf("thinking deltas = %d, want the two the upstream sent", thinkingDeltas.Len())
+	}
+	if stops != 1 {
+		t.Fatalf("thinking block stops = %d, want one", stops)
+	}
+
+	// The text that follows is its own block, with its own start and stop.
+	textAt := -1
+	for i, current := range frames {
+		if current.event == "content_block_start" && current.block == "text" {
+			textAt = i
+			break
+		}
+	}
+	if textAt < 0 {
+		t.Fatalf("no text content_block_start in %+v", frames)
+	}
+	if frames[textAt].index == thinkingIndex {
+		t.Fatalf("text block reused the thinking index %v", thinkingIndex)
+	}
+	if textAt < thinkingAt {
+		t.Fatalf("the text block was announced before the thinking block: %+v", frames)
 	}
 }

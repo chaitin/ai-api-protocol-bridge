@@ -672,3 +672,85 @@ func TestResponsesToChatBridgeEndsRefusalText(t *testing.T) {
 		t.Fatalf("refusal text = %#v, want the text the upstream sent", part["text"])
 	}
 }
+
+// A chat upstream reports reasoning as bare reasoning_content deltas: it has no
+// reasoning item to announce. The decoder opens and ends that item now, so a
+// Responses client reads reasoning_summary_text.delta into an id it was told
+// about and response.completed.output carries the thoughts before the answer
+// instead of dropping them.
+func TestResponsesToChatBridgeCarriesReasoningAsAnItem(t *testing.T) {
+	events := relayChatStreamToResponses(t, []string{
+		`{"id":"chatcmpl-r","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Let me think. "},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-r","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"reasoning_content":"Two plus two."},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-r","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"content":"Four."},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-r","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		`[DONE]`,
+	})
+
+	var (
+		reasoningID string
+		added       int
+		summary     strings.Builder
+		completed   map[string]any
+	)
+	for _, event := range events {
+		var payload map[string]any
+		if err := json.Unmarshal(event.Data, &payload); err != nil {
+			t.Fatalf("Unmarshal(%s) error = %v", event.Event, err)
+		}
+		switch event.Event {
+		case "response.output_item.added":
+			item, _ := payload["item"].(map[string]any)
+			if item["type"] != "reasoning" {
+				continue
+			}
+			added++
+			reasoningID, _ = item["id"].(string)
+		case "response.reasoning_summary_text.delta":
+			if reasoningID == "" || payload["item_id"] != reasoningID {
+				t.Fatalf("reasoning delta item_id = %v, want the announced %q", payload["item_id"], reasoningID)
+			}
+			summary.WriteString(payload["delta"].(string))
+		case "response.completed":
+			completed, _ = payload["response"].(map[string]any)
+		}
+	}
+
+	if added != 1 {
+		t.Fatalf("announced %d reasoning items, want one", added)
+	}
+	if summary.String() != "Let me think. Two plus two." {
+		t.Fatalf("reasoning summary = %q, want the streamed thoughts", summary.String())
+	}
+	if completed == nil {
+		t.Fatal("no response.completed")
+	}
+	output, ok := completed["output"].([]any)
+	if !ok || len(output) != 2 {
+		t.Fatalf("response.completed.output = %#v, want the reasoning and the message", completed["output"])
+	}
+	reasoning, _ := output[0].(map[string]any)
+	if reasoning["type"] != "reasoning" || reasoning["id"] != reasoningID {
+		t.Fatalf("output[0] = %#v, want the announced reasoning item first", output[0])
+	}
+	parts, _ := reasoning["summary"].([]any)
+	if len(parts) != 1 {
+		t.Fatalf("reasoning summary parts = %#v", reasoning["summary"])
+	}
+	part, _ := parts[0].(map[string]any)
+	if part["text"] != "Let me think. Two plus two." {
+		t.Fatalf("reasoning summary text = %v", part["text"])
+	}
+	message, _ := output[1].(map[string]any)
+	if message["type"] != "message" {
+		t.Fatalf("output[1] = %#v, want the message second", output[1])
+	}
+	content, _ := message["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("message content = %#v", message["content"])
+	}
+	text, _ := content[0].(map[string]any)
+	if text["text"] != "Four." {
+		t.Fatalf("message text = %v, want the answer", text["text"])
+	}
+}

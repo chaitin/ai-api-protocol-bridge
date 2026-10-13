@@ -795,3 +795,99 @@ func TestOpenAIChatStreamDecoderEndsRefusalText(t *testing.T) {
 		t.Fatalf("finish parts = %+v, want the refusal text to end before the finish", parts)
 	}
 }
+
+// A chat upstream has no reasoning-start and no reasoning-end event either: its
+// reasoning arrives as bare reasoning_content deltas and simply stops. An
+// encoder opens the block a client reads deltas into on the start, and the
+// Responses encoder only appends the item to the completed response on the end,
+// so the decoder has to report both.
+func TestOpenAIChatStreamDecoderOpensAndEndsReasoning(t *testing.T) {
+	t.Run("content ends the reasoning that came before it", func(t *testing.T) {
+		decoder, err := NewOpenAIChatAdapter().NewStreamDecoder(StreamDecodeOptions{})
+		if err != nil {
+			t.Fatalf("NewStreamDecoder() error = %v", err)
+		}
+
+		parts, err := decoder.Decode(RawStreamEvent{Data: []byte(`{"id":"chatcmpl-r1","object":"chat.completion.chunk","model":"deepseek-flash","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Let me think. "},"finish_reason":null}]}`)})
+		if err != nil {
+			t.Fatalf("Decode(first reasoning) error = %v", err)
+		}
+		if len(parts) != 3 || parts[0].Type != StreamStart || parts[1].Type != StreamReasoningStart || parts[2].Type != StreamReasoningDelta {
+			t.Fatalf("first reasoning parts = %+v, want the start and then the delta", parts)
+		}
+		if parts[1].ID != streamIndexID(0) || parts[2].ID != streamIndexID(0) {
+			t.Fatalf("reasoning ids = %q and %q, want both %q", parts[1].ID, parts[2].ID, streamIndexID(0))
+		}
+
+		// The block is open, so a second delta must not open it again: a client
+		// already reading index 0 cannot take a second start for it.
+		parts, err = decoder.Decode(RawStreamEvent{Data: []byte(`{"id":"chatcmpl-r1","object":"chat.completion.chunk","model":"deepseek-flash","choices":[{"index":0,"delta":{"reasoning_content":"Two plus two."},"finish_reason":null}]}`)})
+		if err != nil {
+			t.Fatalf("Decode(second reasoning) error = %v", err)
+		}
+		if len(parts) != 1 || parts[0].Type != StreamReasoningDelta || parts[0].Delta != "Two plus two." {
+			t.Fatalf("second reasoning parts = %+v, want the delta alone", parts)
+		}
+
+		// Reasoning comes before the message in the item order, so it has to end
+		// before the first content delta opens its own block.
+		parts, err = decoder.Decode(RawStreamEvent{Data: []byte(`{"id":"chatcmpl-r1","object":"chat.completion.chunk","model":"deepseek-flash","choices":[{"index":0,"delta":{"content":"Four."},"finish_reason":null}]}`)})
+		if err != nil {
+			t.Fatalf("Decode(content) error = %v", err)
+		}
+		if len(parts) != 2 || parts[0].Type != StreamReasoningEnd || parts[1].Type != StreamTextDelta {
+			t.Fatalf("content parts = %+v, want the reasoning to end first", parts)
+		}
+		if parts[0].ID != streamIndexID(0) {
+			t.Fatalf("reasoning end id = %q, want %q", parts[0].ID, streamIndexID(0))
+		}
+
+		// And it is ended exactly once.
+		parts, err = decoder.Decode(RawStreamEvent{Data: []byte(`{"id":"chatcmpl-r1","object":"chat.completion.chunk","model":"deepseek-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`)})
+		if err != nil {
+			t.Fatalf("Decode(finish) error = %v", err)
+		}
+		if len(parts) != 2 || parts[0].Type != StreamTextEnd || parts[1].Type != StreamFinish {
+			t.Fatalf("finish parts = %+v, want the message end and the finish", parts)
+		}
+	})
+
+	t.Run("a tool call ends the reasoning the upstream left open", func(t *testing.T) {
+		decoder, err := NewOpenAIChatAdapter().NewStreamDecoder(StreamDecodeOptions{})
+		if err != nil {
+			t.Fatalf("NewStreamDecoder() error = %v", err)
+		}
+		if _, err := decoder.Decode(RawStreamEvent{Data: []byte(`{"id":"chatcmpl-r2","object":"chat.completion.chunk","model":"deepseek-flash","choices":[{"index":0,"delta":{"reasoning_content":"Need the weather tool."},"finish_reason":null}]}`)}); err != nil {
+			t.Fatalf("Decode(reasoning) error = %v", err)
+		}
+
+		parts, err := decoder.Decode(RawStreamEvent{Data: []byte(`{"id":"chatcmpl-r2","object":"chat.completion.chunk","model":"deepseek-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_r","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},"finish_reason":null}]}`)})
+		if err != nil {
+			t.Fatalf("Decode(tool start) error = %v", err)
+		}
+		if len(parts) != 3 || parts[0].Type != StreamReasoningEnd || parts[1].Type != StreamToolInputStart || parts[2].Type != StreamToolInputDelta {
+			t.Fatalf("tool start parts = %+v, want the reasoning to end first", parts)
+		}
+	})
+
+	t.Run("the sentinel ends reasoning the upstream never finished", func(t *testing.T) {
+		decoder, err := NewOpenAIChatAdapter().NewStreamDecoder(StreamDecodeOptions{})
+		if err != nil {
+			t.Fatalf("NewStreamDecoder() error = %v", err)
+		}
+		if _, err := decoder.Decode(RawStreamEvent{Data: []byte(`{"id":"chatcmpl-r3","object":"chat.completion.chunk","model":"deepseek-flash","choices":[{"index":0,"delta":{"reasoning_content":"Thinking."},"finish_reason":null}]}`)}); err != nil {
+			t.Fatalf("Decode(reasoning) error = %v", err)
+		}
+
+		parts, err := decoder.Decode(RawStreamEvent{Data: []byte(`[DONE]`)})
+		if err != nil {
+			t.Fatalf("Decode(DONE) error = %v", err)
+		}
+		if len(parts) != 1 || parts[0].Type != StreamReasoningEnd {
+			t.Fatalf("DONE parts = %+v, want the reasoning end", parts)
+		}
+		if _, err := decoder.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	})
+}
