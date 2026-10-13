@@ -815,6 +815,61 @@ func TestAnthropicMessagesStreamEncoderReusesSingleActiveBlockForEmptyDeltaID(t 
 	}
 }
 
+// A chat upstream has no content_block_start of its own, so a text delta can
+// arrive for a block nothing ever opened. A client reads deltas into a block
+// that was announced first, so the encoder opens one on the delta itself — the
+// mirror of what the Responses encoder does when it has no message item yet.
+func TestAnthropicMessagesStreamEncoderOpensATextBlockForABareDelta(t *testing.T) {
+	encoder, err := NewAnthropicMessagesAdapter().NewStreamEncoder(StreamEncodeOptions{Model: "claude"})
+	if err != nil {
+		t.Fatalf("NewStreamEncoder() error = %v", err)
+	}
+
+	first, err := encoder.Encode(StreamPart{Type: StreamTextDelta, ID: "content_0", Delta: "Hi"})
+	if err != nil {
+		t.Fatalf("Encode(first delta) error = %v", err)
+	}
+	if len(first) != 2 || first[0].Event != "content_block_start" || first[1].Event != "content_block_delta" {
+		t.Fatalf("first delta events = %+v, want a block start and then the delta", first)
+	}
+
+	// The block is open now, so a second delta must not open it again: a client
+	// that is already reading index 0 cannot take a second content_block_start
+	// for it.
+	second, err := encoder.Encode(StreamPart{Type: StreamTextDelta, ID: "content_0", Delta: "!"})
+	if err != nil {
+		t.Fatalf("Encode(second delta) error = %v", err)
+	}
+	if len(second) != 1 || second[0].Event != "content_block_delta" {
+		t.Fatalf("second delta events = %+v, want the delta alone", second)
+	}
+
+	end, err := encoder.Encode(StreamPart{Type: StreamTextEnd, ID: "content_0"})
+	if err != nil {
+		t.Fatalf("Encode(StreamTextEnd) error = %v", err)
+	}
+	if len(end) != 1 || end[0].Event != "content_block_stop" {
+		t.Fatalf("end events = %+v, want the block stop", end)
+	}
+
+	var start, delta, stop anthropicStreamEvent
+	if err := json.Unmarshal(first[0].Data, &start); err != nil {
+		t.Fatalf("Unmarshal(content_block_start) error = %v", err)
+	}
+	if err := json.Unmarshal(first[1].Data, &delta); err != nil {
+		t.Fatalf("Unmarshal(content_block_delta) error = %v", err)
+	}
+	if err := json.Unmarshal(end[0].Data, &stop); err != nil {
+		t.Fatalf("Unmarshal(content_block_stop) error = %v", err)
+	}
+	if start.ContentBlock == nil || start.ContentBlock.Type != "text" {
+		t.Fatalf("content_block_start block = %+v, want a text block", start.ContentBlock)
+	}
+	if start.Index == nil || delta.Index == nil || stop.Index == nil || *start.Index != *delta.Index || *delta.Index != *stop.Index {
+		t.Fatalf("indexes disagree: start=%+v delta=%+v stop=%+v", start.Index, delta.Index, stop.Index)
+	}
+}
+
 func TestAnthropicMessagesStreamEncoderIgnoresEmptyEndWithoutActiveBlock(t *testing.T) {
 	encoder, err := NewAnthropicMessagesAdapter().NewStreamEncoder(StreamEncodeOptions{Model: "claude"})
 	if err != nil {

@@ -440,9 +440,26 @@ func (e *anthropicStreamEncoder) Encode(part StreamPart) ([]RawStreamEvent, erro
 		}
 		return singleAnthropicStreamPayloadEvent("content_block_start", payload)
 	case StreamTextDelta:
+		events := make([]RawStreamEvent, 0, 2)
+		// A chat upstream has no content_block_start of its own: the chat
+		// decoder reports the first content as a StreamTextDelta and nothing
+		// else. Anthropic opens every block before it streams deltas into it,
+		// so the block has to be opened here — the same thing the Responses
+		// encoder does on a delta when it has no message item yet.
+		if _, _, open := e.existingIndexAndKey(e.activeText, part.ID); !open {
+			startEvents, err := e.Encode(StreamPart{Type: StreamTextStart, ID: part.ID})
+			if err != nil {
+				return nil, err
+			}
+			events = append(events, startEvents...)
+		}
 		idx := e.ensureIndex(e.activeText, part.ID)
 		delta := anthropicStreamDelta{Type: "text_delta", Text: part.Delta}
-		return singleAnthropicStreamEvent("content_block_delta", anthropicStreamEvent{Type: "content_block_delta", Index: intPtr(idx), Delta: &delta})
+		deltaEvents, err := singleAnthropicStreamEvent("content_block_delta", anthropicStreamEvent{Type: "content_block_delta", Index: intPtr(idx), Delta: &delta})
+		if err != nil {
+			return nil, err
+		}
+		return append(events, deltaEvents...), nil
 	case StreamTextEnd:
 		idx, key, ok := e.existingIndexAndKey(e.activeText, part.ID)
 		if !ok {
