@@ -1154,8 +1154,8 @@ func decodeOpenAIToolInput(arguments string) (any, error) {
 		return nil, nil
 	}
 
-	var input any
-	if err := json.Unmarshal([]byte(arguments), &input); err != nil {
+	input, ok := decodeToolInputJSON([]byte(arguments))
+	if !ok {
 		return arguments, nil
 	}
 	return input, nil
